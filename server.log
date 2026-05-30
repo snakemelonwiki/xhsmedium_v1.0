@@ -1,0 +1,42 @@
+
+> lan-dual-role-system@0.2.0 start
+> concurrently "npm run start:legacy" "npm run start:backend"
+
+[1] 
+[1] > lan-dual-role-system@0.2.0 start:backend
+[1] > cd backend && npm run start:dev
+[1] 
+[0] 
+[0] > lan-dual-role-system@0.2.0 start:legacy
+[0] > node server.js
+[0] 
+[0] ◇ injected env (6) from .env // tip: ⌘ multiple files { path: ['.env.local', '.env'] }
+[0] node:events:496
+[0]       throw er; // Unhandled 'error' event
+[0]       ^
+[0] 
+[0] Error: listen EADDRINUSE: address already in use 0.0.0.0:3002
+[0]     at Server.setupListenHandle [as _listen2] (node:net:1940:16)
+[0]     at listenInCluster (node:net:1997:12)
+[0]     at node:net:2206:7
+[0]     at process.processTicksAndRejections (node:internal/process/task_queues:90:21)
+[0] Emitted 'error' event on Server instance at:
+[0]     at emitErrorNT (node:net:1976:8)
+[0]     at process.processTicksAndRejections (node:internal/process/task_queues:90:21) {
+[0]   code: 'EADDRINUSE',
+[0]   errno: -4091,
+[0]   syscall: 'listen',
+[0]   address: '0.0.0.0',
+[0]   port: 3002
+[0] }
+[0] 
+[0] Node.js v22.17.1
+[0] npm run start:legacy exited with code 1
+[1] 
+[1] > backend@0.0.1 start:dev
+[1] > nest start --watch
+[1] 
+[1] 
+[1]  Error  ENOTEMPTY: directory not empty, rmdir 'D:\pycharmProjects\xhsmedium_github\backend\dist\modules\lead-drafts'
+[1] 
+[1] npm run start:backend exited with code 0
