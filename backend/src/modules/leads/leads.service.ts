@@ -1,15 +1,18 @@
-import { ConflictException, Injectable } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import { Lead } from '../../entities/lead.entity';
 import { LeadFollowRecord } from '../../entities/lead-follow-record.entity';
 import { Post } from '../../entities/post.entity';
 import { User } from '../../entities/user.entity';
+import { CollaborationTask } from '../../entities/collaboration-task.entity';
 import { makeId } from '../../shared/utils/id-generator';
 import { NotificationsService } from '../notifications/notifications.service';
 import { NOTIFICATION_TYPES } from '../../shared/notifications';
+import { OperationLogsService } from '../operation-logs/operation-logs.service';
 
 interface BoardPatchDto {
+  status?: string;
   assignedSalesUserId?: string | null;
   assignedSalesUserName?: string;
   processStatus?: string;
@@ -25,6 +28,9 @@ interface FollowRecordDto {
   followType?: string;
   content: string;
   nextFollowTime?: string | Date | null;
+  processStatus?: string;
+  intention?: string | null;
+  intentionLevel?: string;
 }
 
 interface LeadFilterOptions {
@@ -38,9 +44,51 @@ interface LeadFilterOptions {
   postType?: string;
   status?: string;
   addStatus?: string;
+  processStatus?: string;
+  search?: string;
   from?: string;
   to?: string;
 }
+
+const LEAD_STATUS_CODES = new Set(['new', 'assigned', 'in_followup', 'in_collaboration', 'operation_handled', 'added_success', 'invalid']);
+const ADD_STATUS_CODES = new Set(['not_added', 'applied', 'not_passed', 'operation_reminded', 'added']);
+const PROCESS_STATUS_CODES = new Set(['not_contacted', 'waiting_pass', 'communicating', 'quoted', 'deal_pending', 'deal_done', 'invalid']);
+
+const STATUS_ALIASES: Record<string, string> = {
+  contact_added: 'added_success',
+  added: 'added_success',
+  rejected: 'invalid',
+  '新客资': 'new',
+  '已分配': 'assigned',
+  '跟进中': 'in_followup',
+  '协同中': 'in_collaboration',
+  '运营已处理': 'operation_handled',
+  '已添加通过': 'added_success',
+  '无效客资': 'invalid',
+};
+
+const ADD_STATUS_ALIASES: Record<string, string> = {
+  rejected: 'not_passed',
+  waiting_pass: 'applied',
+  '未添加': 'not_added',
+  '已申请添加': 'applied',
+  '客户未通过': 'not_passed',
+  '运营已提醒': 'operation_reminded',
+  '已添加通过': 'added',
+};
+
+const PROCESS_STATUS_ALIASES: Record<string, string> = {
+  applied: 'waiting_pass',
+  pending: 'not_contacted',
+  '未接': 'not_contacted',
+  '未联系': 'not_contacted',
+  '待通过': 'waiting_pass',
+  '沟通中': 'communicating',
+  '已报价': 'quoted',
+  '待成交': 'deal_pending',
+  '已成交': 'deal_done',
+  '无效': 'invalid',
+};
 
 @Injectable()
 export class LeadsService {
@@ -53,7 +101,10 @@ export class LeadsService {
     private readonly postRepository: Repository<Post>,
     @InjectRepository(User)
     private readonly userRepository: Repository<User>,
+    @InjectRepository(CollaborationTask)
+    private readonly collaborationRepository: Repository<CollaborationTask>,
     private readonly notificationsService: NotificationsService,
+    private readonly operationLogsService: OperationLogsService,
   ) {}
 
   /**
@@ -72,7 +123,7 @@ export class LeadsService {
 
   async findAll(): Promise<any[]> {
     const rows = await this.leadRepository.find({ order: { createdAt: 'DESC' } });
-    return rows.map(this.mapLead);
+    return this.mapLeads(rows);
   }
 
   async findByEmployee(employeeId: string): Promise<any[]> {
@@ -80,7 +131,7 @@ export class LeadsService {
       where: { employeeId },
       order: { createdAt: 'DESC' },
     });
-    return rows.map(this.mapLead);
+    return this.mapLeads(rows);
   }
 
   // ---- §9 / AC-10.2 客资列表分页 ----
@@ -94,7 +145,7 @@ export class LeadsService {
       take: safeLimit,
       skip: safeOffset,
     });
-    return { items: rows.map(this.mapLead), total, limit: safeLimit, offset: safeOffset };
+    return { items: await this.mapLeads(rows), total, limit: safeLimit, offset: safeOffset };
   }
 
   async findByEmployeePaged(employeeId: string, limit: number, offset: number): Promise<{ items: any[]; total: number; limit: number; offset: number }> {
@@ -106,7 +157,7 @@ export class LeadsService {
       take: safeLimit,
       skip: safeOffset,
     });
-    return { items: rows.map(this.mapLead), total, limit: safeLimit, offset: safeOffset };
+    return { items: await this.mapLeads(rows), total, limit: safeLimit, offset: safeOffset };
   }
 
   async findFiltered(filters: LeadFilterOptions): Promise<any[]> {
@@ -114,7 +165,7 @@ export class LeadsService {
     const rows = await qb
       .orderBy('l.created_at', 'DESC')
       .getMany();
-    return rows.map(this.mapLead);
+    return this.mapLeads(rows);
   }
 
   async findFilteredPaged(filters: LeadFilterOptions, limit: number, offset: number): Promise<{ items: any[]; total: number; limit: number; offset: number }> {
@@ -125,7 +176,7 @@ export class LeadsService {
       .take(safeLimit)
       .skip(safeOffset);
     const [rows, total] = await qb.getManyAndCount();
-    return { items: rows.map(this.mapLead), total, limit: safeLimit, offset: safeOffset };
+    return { items: await this.mapLeads(rows), total, limit: safeLimit, offset: safeOffset };
   }
 
   async findTomorrowFollowups(salesUserId: string): Promise<any[]> {
@@ -140,7 +191,7 @@ export class LeadsService {
       .andWhere('l.assigned_sales_user_id = :uid', { uid: salesUserId })
       .orderBy('l.next_follow_time', 'ASC')
       .getMany();
-    return rows.map(this.mapLead);
+    return this.mapLeads(rows);
   }
 
   async findTomorrowFollowupsPaged(salesUserId: string, limit: number, offset: number): Promise<{ items: any[]; total: number; limit: number; offset: number }> {
@@ -159,7 +210,7 @@ export class LeadsService {
       .take(safeLimit)
       .skip(safeOffset);
     const [rows, total] = await qb.getManyAndCount();
-    return { items: rows.map(this.mapLead), total, limit: safeLimit, offset: safeOffset };
+    return { items: await this.mapLeads(rows), total, limit: safeLimit, offset: safeOffset };
   }
 
   private clampLimit(limit: number): number {
@@ -194,6 +245,13 @@ export class LeadsService {
     if (filters.platform) qb.andWhere('l.platform = :platform', { platform: filters.platform });
     if (filters.status) qb.andWhere('l.status = :status', { status: filters.status });
     if (filters.addStatus) qb.andWhere('l.add_status = :addStatus', { addStatus: filters.addStatus });
+    if (filters.processStatus) qb.andWhere('l.process_status = :processStatus', { processStatus: filters.processStatus });
+    if (filters.search && filters.search.trim()) {
+      qb.andWhere(
+        '(l.contact_info LIKE :search OR l.nickname LIKE :search OR l.lead_code LIKE :search OR l.note LIKE :search)',
+        { search: `%${filters.search.trim()}%` },
+      );
+    }
     if (filters.from) qb.andWhere('l.created_at >= :from', { from: filters.from });
     if (filters.to) qb.andWhere('l.created_at < :to', { to: filters.to });
     if (filters.postType) {
@@ -244,19 +302,41 @@ export class LeadsService {
     await this.leadRepository.update(id, dto);
   }
 
+  async findOne(id: string, actor?: { actorUserId?: string; actorEmployeeId?: string; actorRole?: string }): Promise<any | null> {
+    const row = await this.leadRepository.findOne({ where: { id } });
+    if (!row) return null;
+    const role = actor?.actorRole || '';
+    const isAdminLike = role === 'admin' || role === 'owner';
+    if (!isAdminLike && role === 'sales' && actor?.actorUserId && row.assignedSalesUserId !== actor.actorUserId) {
+      return null;
+    }
+    if (!isAdminLike && role !== 'sales' && actor?.actorEmployeeId && row.employeeId !== actor.actorEmployeeId) {
+      return null;
+    }
+    const latestCollaboration = await this.latestCollaborationByLeadIds([row.id]);
+    return this.mapLead(row, undefined, latestCollaboration.get(row.id));
+  }
+
   async updateBoard(id: string, dto: BoardPatchDto, actorUserId: string): Promise<void> {
     const current = await this.leadRepository.findOne({ where: { id } });
     if (!current) return;
 
     const next: Partial<Lead> = {};
+    const normalized = this.normalizeBoardPatch(dto);
+    if (normalized.status !== undefined) next.status = normalized.status || current.status;
     if (dto.assignedSalesUserId !== undefined) next.assignedSalesUserId = dto.assignedSalesUserId || null;
     if (dto.assignedSalesUserName !== undefined) next.assignedSalesUserName = dto.assignedSalesUserName || '';
-    if (dto.processStatus !== undefined) next.processStatus = dto.processStatus || 'not_contacted';
-    if (dto.addStatus !== undefined) next.addStatus = dto.addStatus || 'not_added';
+    if (normalized.processStatus !== undefined) next.processStatus = normalized.processStatus || 'not_contacted';
+    if (normalized.addStatus !== undefined) next.addStatus = normalized.addStatus || 'not_added';
     if (dto.intention !== undefined) next.intention = dto.intention || null;
     if (dto.intentionLevel !== undefined) next.intentionLevel = dto.intentionLevel || 'pending';
     if (dto.nextFollowTime !== undefined) {
       next.nextFollowTime = dto.nextFollowTime ? new Date(dto.nextFollowTime) : null;
+    }
+    this.applySalesStateTransition(current, next, normalized);
+    const nextLeadStatus = this.resolveLeadStatus(current, normalized);
+    if (nextLeadStatus) {
+      next.status = nextLeadStatus;
     }
 
     const updateResult = await this.leadRepository.update(
@@ -268,13 +348,13 @@ export class LeadsService {
     }
 
     // §11.1 customer_added / customer_not_passed: addStatus 关键变更回写来源运营。
-    if (dto.addStatus !== undefined && dto.addStatus !== current.addStatus && current.employeeId) {
+    if (normalized.addStatus !== undefined && normalized.addStatus !== current.addStatus && current.employeeId) {
       // employeeId 在 leads 表里是 employees.id (来源运营对应的员工 ID)，但通知 receiver_id
       // 走 users 表。来源运营若关联了员工，他们 user 行的 employee_id == 员工 ID，
       // 因此用 raw query 由 employees.id 反查 users.id 兜底（找不到就跳过）。
       const sourceUserId = await this.findUserIdByEmployeeId(current.employeeId);
       if (sourceUserId) {
-        if (dto.addStatus === 'added') {
+        if (normalized.addStatus === 'added') {
           await this.notificationsService.create({
             receiverIds: [sourceUserId],
             senderId: actorUserId || null,
@@ -285,7 +365,7 @@ export class LeadsService {
             relatedId: id,
             relatedType: 'lead',
           });
-        } else if (dto.addStatus === 'rejected') {
+        } else if (normalized.addStatus === 'not_passed') {
           await this.notificationsService.create({
             receiverIds: [sourceUserId],
             senderId: actorUserId || null,
@@ -302,7 +382,7 @@ export class LeadsService {
 
     const keyFieldChanged =
       (dto.intentionLevel !== undefined && dto.intentionLevel !== current.intentionLevel) ||
-      (dto.processStatus !== undefined && dto.processStatus !== current.processStatus) ||
+      (normalized.processStatus !== undefined && normalized.processStatus !== current.processStatus) ||
       (dto.nextFollowTime !== undefined) ||
       (dto.followNote && dto.followNote.trim());
 
@@ -312,8 +392,8 @@ export class LeadsService {
     if (dto.intentionLevel !== undefined && dto.intentionLevel !== current.intentionLevel) {
       noteParts.push(`意向度: ${current.intentionLevel || '-'} → ${dto.intentionLevel}`);
     }
-    if (dto.processStatus !== undefined && dto.processStatus !== current.processStatus) {
-      noteParts.push(`处理状态: ${current.processStatus || '-'} → ${dto.processStatus}`);
+    if (normalized.processStatus !== undefined && normalized.processStatus !== current.processStatus) {
+      noteParts.push(`处理状态: ${current.processStatus || '-'} → ${normalized.processStatus}`);
     }
     if (dto.followNote && dto.followNote.trim()) {
       noteParts.push(dto.followNote.trim());
@@ -333,6 +413,10 @@ export class LeadsService {
     if (!dto.content || !dto.content.trim()) {
       throw new Error('content required');
     }
+    const current = await this.leadRepository.findOne({ where: { id: leadId } });
+    if (!current) throw new Error('lead not found');
+    const normalized = this.normalizeFollowRecord(dto);
+
     await this.followRepository.save({
       id: makeId(),
       leadId,
@@ -341,21 +425,141 @@ export class LeadsService {
       content: dto.content.trim(),
       nextFollowTime: dto.nextFollowTime ? new Date(dto.nextFollowTime) : null,
     });
+    const patch: Partial<Lead> = {};
     if (dto.nextFollowTime !== undefined) {
-      await this.leadRepository.update(leadId, {
-        nextFollowTime: dto.nextFollowTime ? new Date(dto.nextFollowTime) : null,
-      });
+      patch.nextFollowTime = dto.nextFollowTime ? new Date(dto.nextFollowTime) : null;
+    }
+    if (normalized.processStatus !== undefined) patch.processStatus = normalized.processStatus || 'not_contacted';
+    if (dto.intention !== undefined) patch.intention = dto.intention || null;
+    if (dto.intentionLevel !== undefined) patch.intentionLevel = dto.intentionLevel || 'pending';
+    this.applySalesStateTransition(current, patch, normalized);
+    if (Object.keys(patch).length > 0) {
+      await this.leadRepository.update(leadId, patch);
     }
   }
 
+  async updateSalesStatus(id: string, dto: BoardPatchDto, actorUserId: string): Promise<any | null> {
+    const current = await this.leadRepository.findOne({ where: { id } });
+    if (!current) return null;
+
+    await this.updateBoard(id, dto, actorUserId);
+    const updated = await this.leadRepository.findOne({ where: { id } });
+    if (updated) {
+      await this.operationLogsService.log({
+        userId: actorUserId || '',
+        action: 'lead_status_update',
+        targetType: 'lead',
+        targetId: id,
+        detail: JSON.stringify({
+          from: {
+            status: current.status,
+            processStatus: current.processStatus,
+            addStatus: current.addStatus,
+            intentionLevel: current.intentionLevel,
+          },
+          to: {
+            status: updated.status,
+            processStatus: updated.processStatus,
+            addStatus: updated.addStatus,
+            intentionLevel: updated.intentionLevel,
+          },
+        }),
+      });
+    }
+    if (!updated) return null;
+    const latestCollaboration = await this.latestCollaborationByLeadIds([updated.id]);
+    return this.mapLead(updated, undefined, latestCollaboration.get(updated.id));
+  }
+
+  private applySalesStateTransition(current: Lead, next: Partial<Lead>, dto: BoardPatchDto | FollowRecordDto): void {
+    const nextAddStatus = next.addStatus ?? current.addStatus;
+    const nextProcessStatus = next.processStatus ?? current.processStatus;
+    const hasText =
+      ('followNote' in dto && Boolean(dto.followNote?.trim())) ||
+      ('content' in dto && Boolean(dto.content?.trim()));
+    const hasFollowSignal =
+      hasText ||
+      dto.nextFollowTime !== undefined ||
+      nextProcessStatus !== current.processStatus ||
+      nextAddStatus !== current.addStatus;
+
+    if (nextAddStatus === 'added') {
+      next.status = 'added_success';
+      return;
+    }
+    if (nextAddStatus === 'not_passed' || nextAddStatus === 'rejected' || nextProcessStatus === 'invalid') {
+      next.status = 'invalid';
+      if (nextAddStatus === 'rejected') next.addStatus = 'not_passed';
+      return;
+    }
+    if (!next.status && hasFollowSignal && current.status !== 'in_collaboration' && current.status !== 'operation_handled') {
+      next.status = 'in_followup';
+    }
+  }
+
+  private resolveLeadStatus(current: Lead, dto: BoardPatchDto): string | null {
+    if (dto.status !== undefined) return dto.status || current.status;
+    if (dto.processStatus === 'invalid') return 'invalid';
+    if (dto.addStatus === 'added') return 'added_success';
+    if (dto.processStatus === 'in_collaboration') return 'in_collaboration';
+    if (dto.processStatus === 'operation_handled') return 'operation_handled';
+    const hasSalesAction =
+      dto.processStatus !== undefined ||
+      dto.addStatus !== undefined ||
+      Boolean(dto.followNote && dto.followNote.trim());
+    if (hasSalesAction && current.status !== 'in_collaboration') {
+      return 'in_followup';
+    }
+    return null;
+  }
+
+  private normalizeBoardPatch(dto: BoardPatchDto): BoardPatchDto {
+    return {
+      ...dto,
+      status: this.normalizeStatusValue('status', dto.status),
+      addStatus: this.normalizeStatusValue('addStatus', dto.addStatus),
+      processStatus: this.normalizeStatusValue('processStatus', dto.processStatus),
+    };
+  }
+
+  private normalizeFollowRecord(dto: FollowRecordDto): FollowRecordDto {
+    return {
+      ...dto,
+      processStatus: this.normalizeStatusValue('processStatus', dto.processStatus),
+    };
+  }
+
+  private normalizeStatusValue(kind: 'status' | 'addStatus' | 'processStatus', value?: string): string | undefined {
+    if (value === undefined || value === '') return value;
+    const trimmed = String(value).trim();
+    const aliases = kind === 'status' ? STATUS_ALIASES : kind === 'addStatus' ? ADD_STATUS_ALIASES : PROCESS_STATUS_ALIASES;
+    const normalized = aliases[trimmed] || trimmed;
+    const allowed = kind === 'status' ? LEAD_STATUS_CODES : kind === 'addStatus' ? ADD_STATUS_CODES : PROCESS_STATUS_CODES;
+    if (!allowed.has(normalized)) {
+      throw new BadRequestException(`invalid ${kind}: ${trimmed}`);
+    }
+    return normalized;
+  }
+
+  async canAccessLead(leadId: string, actor?: { actorUserId?: string; actorEmployeeId?: string; actorRole?: string }): Promise<boolean> {
+    if (!leadId) return false;
+    const row = await this.leadRepository.findOne({ where: { id: leadId } });
+    if (!row) return false;
+    const role = actor?.actorRole || '';
+    if (role === 'admin' || role === 'owner') return true;
+    if (role === 'sales') return Boolean(actor?.actorUserId && row.assignedSalesUserId === actor.actorUserId);
+    return Boolean(actor?.actorEmployeeId && row.employeeId === actor.actorEmployeeId);
+  }
+
   async listFollowRecords(leadId: string, limit = 50, offset = 0): Promise<any[]> {
+    const lead = await this.leadRepository.findOne({ where: { id: leadId } });
     const rows = await this.followRepository.find({
       where: { leadId },
       order: { createdAt: 'DESC' },
       take: this.clampLimit(limit),
       skip: Math.max(Number(offset) || 0, 0),
     });
-    return rows.map((r) => this.mapFollowRecord(r));
+    return rows.map((r) => this.mapFollowRecord(r, lead || undefined));
   }
 
   /**
@@ -378,15 +582,16 @@ export class LeadsService {
       take: safeLimit,
       skip: safeOffset,
     });
+    const lead = await this.leadRepository.findOne({ where: { id: leadId } });
     return {
-      items: rows.map((r) => this.mapFollowRecord(r)),
+      items: rows.map((r) => this.mapFollowRecord(r, lead || undefined)),
       total,
       limit: safeLimit,
       offset: safeOffset,
     };
   }
 
-  private mapFollowRecord(r: LeadFollowRecord): any {
+  private mapFollowRecord(r: LeadFollowRecord, lead?: Lead): any {
     return {
       id: r.id,
       leadId: r.leadId,
@@ -394,6 +599,10 @@ export class LeadsService {
       followType: r.followType,
       content: r.content,
       nextFollowTime: r.nextFollowTime,
+      nextFollowAt: r.nextFollowTime,
+      processStatus: lead?.processStatus,
+      intentionLevel: lead?.intentionLevel,
+      leadStatus: lead?.status,
       createdAt: r.createdAt,
     };
   }
@@ -697,9 +906,9 @@ export class LeadsService {
     postType?: string;
     status?: string;
     addStatus?: string;
+    processStatus?: string;
   }): Promise<any> {
     const scope = opts.scope || 'all';
-    const where: any = {};
     const scopeFilters: LeadFilterOptions = {
       scope,
       employeeId: opts.employeeId,
@@ -738,6 +947,7 @@ export class LeadsService {
       postType: opts.postType,
       status: opts.status,
       addStatus: opts.addStatus,
+      processStatus: opts.processStatus,
     });
 
     const total = await qbBase.getCount();
@@ -797,6 +1007,7 @@ export class LeadsService {
         postType: opts.postType || null,
         status: opts.status || null,
         addStatus: opts.addStatus || null,
+        processStatus: opts.processStatus || null,
       },
     };
   }
@@ -849,10 +1060,55 @@ export class LeadsService {
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   }
 
-  private mapLead(row: Lead): any {
+  private async mapLeads(rows: Lead[]): Promise<any[]> {
+    if (rows.length === 0) return [];
+    const latest = rows.length <= 200
+      ? await this.latestFollowByLeadIds(rows.map((row) => row.id))
+      : new Map<string, LeadFollowRecord>();
+    const latestCollaboration = rows.length <= 200
+      ? await this.latestCollaborationByLeadIds(rows.map((row) => row.id))
+      : new Map<string, CollaborationTask>();
+    return rows.map((row) => this.mapLead(row, latest.get(row.id), latestCollaboration.get(row.id)));
+  }
+
+  private async latestFollowByLeadIds(leadIds: string[]): Promise<Map<string, LeadFollowRecord>> {
+    const ids = Array.from(new Set(leadIds.filter(Boolean)));
+    if (ids.length === 0) return new Map();
+    const rows = await this.followRepository.find({
+      where: { leadId: In(ids) },
+      order: { createdAt: 'DESC' },
+    });
+    const latest = new Map<string, LeadFollowRecord>();
+    for (const row of rows) {
+      if (!latest.has(row.leadId)) {
+        latest.set(row.leadId, row);
+      }
+    }
+    return latest;
+  }
+
+  private async latestCollaborationByLeadIds(leadIds: string[]): Promise<Map<string, CollaborationTask>> {
+    const ids = Array.from(new Set(leadIds.filter(Boolean)));
+    if (ids.length === 0) return new Map();
+    const rows = await this.collaborationRepository.find({
+      where: { leadId: In(ids) },
+      order: { requestedAt: 'DESC' },
+    });
+    const latest = new Map<string, CollaborationTask>();
+    for (const row of rows) {
+      if (!latest.has(row.leadId)) {
+        latest.set(row.leadId, row);
+      }
+    }
+    return latest;
+  }
+
+  private mapLead(row: Lead, latestFollow?: LeadFollowRecord, latestCollaboration?: CollaborationTask): any {
     return {
       id: row.id,
       employeeId: row.employeeId,
+      operatorId: row.employeeId,
+      operatorName: row.salesUserName || row.assignedSalesUserName || null,
       accountId: row.accountId,
       postId: row.postId,
       platform: row.platform,
@@ -871,14 +1127,18 @@ export class LeadsService {
       assignedSalesUserId: row.assignedSalesUserId,
       assignedSalesUserName: row.assignedSalesUserName,
       processStatus: row.processStatus,
+      collaborationStatus: latestCollaboration?.status || 'none',
       addStatus: row.addStatus,
       intention: row.intention,
       leadCode: row.leadCode,
       intentionLevel: row.intentionLevel,
       addMethod: row.addMethod,
       nextFollowTime: row.nextFollowTime,
+      nextFollowAt: row.nextFollowTime,
       matchedPostId: row.matchedPostId,
       sourceUnknown: !!row.sourceUnknown,
+      latestFollowNote: latestFollow?.content || row.salesFeedback || row.note || null,
+      latestFollowAt: latestFollow?.createdAt || row.salesUpdatedAt || row.updatedAt,
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
     };

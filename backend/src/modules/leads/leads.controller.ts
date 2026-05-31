@@ -1,12 +1,16 @@
-import { Controller, Get, Post, Put, Delete, Body, Param, Req, Res, Query, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Put, Patch, Delete, Body, Param, Req, Res, Query, UseGuards } from '@nestjs/common';
 import { LeadsService } from './leads.service';
 import { Request, Response } from 'express';
 import { makeId } from '../../shared/utils/id-generator';
 import { DebounceGuard } from '../../common/debounce.guard';
+import { CollaborationTasksService } from '../collaboration-tasks/collaboration-tasks.service';
 
 @Controller('leads')
 export class LeadsController {
-  constructor(private readonly leadsService: LeadsService) {}
+  constructor(
+    private readonly leadsService: LeadsService,
+    private readonly collaborationTasksService: CollaborationTasksService,
+  ) {}
 
   @Get()
   async findAll(
@@ -21,6 +25,10 @@ export class LeadsController {
     @Query('postType') postType?: string,
     @Query('status') status?: string,
     @Query('addStatus') addStatus?: string,
+    @Query('processStatus') processStatus?: string,
+    @Query('q') q?: string,
+    @Query('search') search?: string,
+    @Query('keyword') keyword?: string,
     @Query('from') from?: string,
     @Query('to') to?: string,
   ) {
@@ -40,6 +48,8 @@ export class LeadsController {
       postType,
       status,
       addStatus,
+      processStatus,
+      search: q || search || keyword,
       from,
       to,
     };
@@ -71,6 +81,7 @@ export class LeadsController {
     @Query('postType') postType?: string,
     @Query('status') status?: string,
     @Query('addStatus') addStatus?: string,
+    @Query('processStatus') processStatus?: string,
   ) {
     const session = (req as any).session;
     const result = await this.leadsService.stats({
@@ -87,6 +98,7 @@ export class LeadsController {
       postType,
       status,
       addStatus,
+      processStatus,
     });
     return res.json(result);
   }
@@ -225,7 +237,7 @@ export class LeadsController {
       budget: body.budget,
       majorContent: body.majorContent,
       ip: body.ip,
-      status: body.status || 'new',
+      status: body.status || (body.assignedSalesUserId ? 'assigned' : 'new'),
       dealAmount: body.dealAmount,
       note: body.note,
       captureImageUrl: body.captureImageUrl,
@@ -239,6 +251,20 @@ export class LeadsController {
       intention: body.intention || null,
     });
     return res.json({ ok: true });
+  }
+
+  @Get(':id')
+  async findOne(@Param('id') id: string, @Req() req: Request, @Res() res: Response) {
+    const session = (req as any).session;
+    const row = await this.leadsService.findOne(id, {
+      actorUserId: session?.userId || session?.id || '',
+      actorEmployeeId: session?.employeeId || '',
+      actorRole: session?.role || '',
+    });
+    if (!row) {
+      return res.status(404).json({ ok: false, message: 'not found' });
+    }
+    return res.json(row);
   }
 
   @Put(':id')
@@ -273,7 +299,16 @@ export class LeadsController {
   async updateBoard(@Param('id') id: string, @Body() body: any, @Req() req: Request, @Res() res: Response) {
     const session = (req as any).session;
     const actorUserId = session?.userId || session?.id || body.actorUserId || '';
+    const canAccess = await this.leadsService.canAccessLead(id, {
+      actorUserId,
+      actorEmployeeId: session?.employeeId || '',
+      actorRole: session?.role || '',
+    });
+    if (!canAccess) {
+      return res.status(404).json({ ok: false, message: 'not found' });
+    }
     await this.leadsService.updateBoard(id, {
+      status: body.status,
       assignedSalesUserId: body.assignedSalesUserId,
       assignedSalesUserName: body.assignedSalesUserName,
       processStatus: body.processStatus,
@@ -287,14 +322,55 @@ export class LeadsController {
     return res.json({ ok: true });
   }
 
+  @Patch(':id/status')
+  @UseGuards(DebounceGuard)
+  async updateStatus(@Param('id') id: string, @Body() body: any, @Req() req: Request, @Res() res: Response) {
+    const session = (req as any).session;
+    const actorUserId = session?.userId || session?.id || body.actorUserId || '';
+    const canAccess = await this.leadsService.canAccessLead(id, {
+      actorUserId,
+      actorEmployeeId: session?.employeeId || '',
+      actorRole: session?.role || '',
+    });
+    if (!canAccess) {
+      return res.status(404).json({ ok: false, message: 'not found' });
+    }
+    try {
+      const lead = await this.leadsService.updateSalesStatus(id, {
+        status: body.status,
+        processStatus: body.processStatus,
+        addStatus: body.addStatus,
+        intention: body.intention,
+        intentionLevel: body.intentionLevel,
+        nextFollowTime: body.nextFollowTime,
+        followNote: body.followNote || body.content || body.note,
+        followType: body.followType,
+      }, actorUserId);
+      if (!lead) return res.status(404).json({ ok: false, message: 'not found' });
+      return res.json({ ok: true, lead });
+    } catch (err: any) {
+      return res.status(422).json({ ok: false, message: err.message || 'invalid' });
+    }
+  }
+
   @Get(':id/follow-records')
   async listFollowRecords(
     @Param('id') id: string,
     @Query('limit') limit: string,
     @Query('offset') offset: string,
     @Query('paged') paged: string,
+    @Req() req: Request,
     @Res() res: Response,
   ) {
+    const session = (req as any).session;
+    const canAccess = await this.leadsService.canAccessLead(id, {
+      actorUserId: session?.userId || session?.id || '',
+      actorEmployeeId: session?.employeeId || '',
+      actorRole: session?.role || '',
+    });
+    if (!canAccess) {
+      return res.status(404).json({ ok: false, message: 'not found' });
+    }
     // §9 / AC-10.2 same shape switch as GET /api/leads:
     //   - 没传 limit/offset 任一 → 返回数组（旧前端兼容，前端把 await 出来的当作 Array 用）
     //   - 显式传了 limit/offset，或 paged=1 → 返回 { items, total, limit, offset }
@@ -326,13 +402,57 @@ export class LeadsController {
   ) {
     const session = (req as any).session;
     const actorUserId = session?.userId || session?.id || body.actorUserId || '';
+    const canAccess = await this.leadsService.canAccessLead(id, {
+      actorUserId,
+      actorEmployeeId: session?.employeeId || '',
+      actorRole: session?.role || '',
+    });
+    if (!canAccess) {
+      return res.status(404).json({ ok: false, message: 'not found' });
+    }
     try {
       await this.leadsService.addFollowRecord(id, actorUserId, {
         followType: body.followType,
         content: body.content,
         nextFollowTime: body.nextFollowTime,
+        processStatus: body.processStatus,
+        intention: body.intention,
+        intentionLevel: body.intentionLevel,
       });
       return res.json({ ok: true });
+    } catch (err: any) {
+      return res.status(422).json({ ok: false, message: err.message || 'invalid' });
+    }
+  }
+
+  @Post(':id/collaboration')
+  async createCollaboration(
+    @Param('id') id: string,
+    @Body() body: any,
+    @Req() req: Request,
+    @Res() res: Response,
+  ) {
+    const session = (req as any).session;
+    const requesterId = session?.userId || session?.id || body.actorUserId || '';
+    if (!requesterId) {
+      return res.status(401).json({ ok: false, message: 'no requester' });
+    }
+    const canAccess = await this.leadsService.canAccessLead(id, {
+      actorUserId: requesterId,
+      actorEmployeeId: session?.employeeId || '',
+      actorRole: session?.role || '',
+    });
+    if (!canAccess) {
+      return res.status(404).json({ ok: false, message: 'not found' });
+    }
+    try {
+      const task = await this.collaborationTasksService.create({
+        leadId: id,
+        type: body.type,
+        reason: body.reason || body.remark || null,
+        requesterId,
+      });
+      return res.json({ ok: true, task });
     } catch (err: any) {
       return res.status(422).json({ ok: false, message: err.message || 'invalid' });
     }

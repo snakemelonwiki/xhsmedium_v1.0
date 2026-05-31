@@ -1,10 +1,25 @@
-import { Controller, Get, Post, Param, Req, Res, Query, Body } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Param, Req, Res, Query, Body } from '@nestjs/common';
 import { NotificationsService } from './notifications.service';
 import { Request, Response } from 'express';
 
 @Controller('notifications')
 export class NotificationsController {
   constructor(private readonly notificationsService: NotificationsService) {}
+
+  @Get('unread-count')
+  async unreadCount(
+    @Req() req: Request,
+    @Res() res: Response,
+    @Query('actorUserId') actorUserId?: string,
+  ) {
+    const session = (req as any).session;
+    const user = (req as any).user;
+    const userId = session?.userId || session?.id || user?.sub || user?.id || actorUserId || '';
+    const userRole = session?.role || user?.role || 'staff';
+    const portType = this.resolvePortType(userRole);
+    const unreadCount = await this.notificationsService.countUnread(userId, portType);
+    return res.json({ unreadCount });
+  }
 
   @Get()
   async findAll(
@@ -18,35 +33,15 @@ export class NotificationsController {
   ) {
     const session = (req as any).session;
     const user = (req as any).user;
-
-    console.log('[DEBUG] Request info:', {
-      hasSession: !!session,
-      hasUser: !!user,
-      session,
-      user,
-      authHeader: req.headers.authorization?.substring(0, 50),
-    });
-
     const userId = session?.userId || session?.id || user?.sub || user?.id || actorUserId || '';
     const userRole = session?.role || user?.role || 'staff';
 
-    // 根据用户角色确定端口类型
-    let portType: string;
-    if (userRole === 'sales') {
-      portType = 'sales';
-    } else if (userRole === 'academic') {
-      portType = 'academic';
-    } else {
-      portType = 'operations';
-    }
+    const portType = this.resolvePortType(userRole);
 
-    console.log('[DEBUG] Notifications query:', { userId, userRole, portType, status, type, limit, offset });
-
-    // 暂时不筛选portType，测试是否有数据
     const result = await this.notificationsService.listForUser(userId, {
       status: status === 'unread' ? 'unread' : 'all',
       type: type || undefined,
-      // portType,  // 暂时注释掉
+      portType,
       limit: limit ? Number(limit) : 30,
       offset: offset ? Number(offset) : 0,
     });
@@ -73,6 +68,19 @@ export class NotificationsController {
     return res.json({ ok, changed: ok });
   }
 
+  @Patch(':id/read')
+  async patchMarkRead(
+    @Param('id') id: string,
+    @Body() body: any,
+    @Req() req: Request,
+    @Res() res: Response,
+  ) {
+    const session = (req as any).session;
+    const userId = session?.userId || session?.id || body?.actorUserId || '';
+    const ok = await this.notificationsService.markRead(id, userId);
+    return res.json({ ok, changed: ok });
+  }
+
   @Post('read-all')
   async markAllRead(
     @Body() body: any,
@@ -83,5 +91,11 @@ export class NotificationsController {
     const userId = session?.userId || session?.id || body?.actorUserId || '';
     const affected = await this.notificationsService.markAllRead(userId);
     return res.json({ ok: true, affected });
+  }
+
+  private resolvePortType(userRole: string): string {
+    if (userRole === 'sales') return 'sales';
+    if (userRole === 'academic') return 'academic';
+    return 'operations';
   }
 }
