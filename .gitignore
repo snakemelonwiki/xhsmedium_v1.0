@@ -1,34 +1,11 @@
 .env
-.env.*
-!.env.example
+.env.local
 .env_snakemelon
 node_modules/
 uploads/
 backups/
 .idea/
-.vscode/
 *.log
 data.json
 daily-snapshots.json
 .playwright-profiles/
-
-# 本地启动脚本（按机器各自维护，不入库）
-start.js
-start-dev.cmd
-start-dev.sh
-
-# 本地敏感/临时文件
-password_backup.txt
-plan.md
-screenshots/
-
-# 工作树内的 agent 副本与历史快照
-.claude/worktrees/
-versions/
-
-# 下级 lockfile 由各模块自行维护
-backend/package-lock.json
-
-# 打包产物
-*.zip
-dist/

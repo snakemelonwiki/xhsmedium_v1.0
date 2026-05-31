@@ -4,9 +4,8 @@
 
 // ===== L594-L818 renderApp / renderFlash / renderNotificationPanel / renderCurrentView / renderImageViewer =====
 function renderApp() {
-  // T-22.5 paginationjs 实例清理：renderApp 即将全量 innerHTML 覆盖，旧分页器
-  // jQuery 内部缓存需先释放，否则 destroy 会失败 + 内存泄漏
-  if (typeof destroyAllPaginators === "function") destroyAllPaginators();
+  // 清理所有资源：定时器、监听器、未完成请求、分页器
+  if (typeof cleanupAllResources === "function") cleanupAllResources();
   const isOwner = state.user.role === "owner";
   const isAdmin = state.user.role === "admin";
   const isSales = state.user.role === "sales";
@@ -15,6 +14,7 @@ function renderApp() {
     ["dashboard", "总览"],
     ["personal-board", "个人看板"],
     ["posts", "作品看板"],
+    ["staff-gallery", "作品广场"],
     ["account-viz", "分析看板"],
     ["leads", "客资看板"],
     ["orders", "订单看板"],
@@ -28,6 +28,7 @@ function renderApp() {
   const staffViews = [
     ["staff-rankings", "运营排行榜"],
     ["personal-board", "个人看板"],
+    ["staff-gallery", "作品广场"],
     ["post-entry", "作品录入"],
     ["staff-leads-board", "客资看板"],
     ["lead-entry", "客资录入"],
@@ -124,7 +125,7 @@ function renderApp() {
   `;
 
   document.querySelectorAll("[data-view]").forEach((button) => {
-    button.addEventListener("click", () => {
+    button.addEventListener("click", async () => {
       // T-17: 切换视图时取消未完成请求，避免旧页面请求影响新页面
       if (typeof abortAllPendingRequests === "function") abortAllPendingRequests();
       state.currentView = button.dataset.view;
@@ -132,6 +133,9 @@ function renderApp() {
       if (button.dataset.view === "sales-collabs" || button.dataset.view === "lead-collabs") {
         state.collabTasks = null;
         state.collabTasksLoading = false;
+      }
+      if (button.dataset.view === "staff-gallery" && typeof loadPlazaPosts === "function") {
+        await loadPlazaPosts(state.plazaView || "all");
       }
       renderApp();
     });
@@ -143,12 +147,19 @@ function renderApp() {
       await api("/api/auth/logout", { method: "POST" });
     } catch {}
     localStorage.removeItem("lan_system_token");
+    if (typeof closeNotificationSocket === "function") closeNotificationSocket();
     state.token = "";
     state.user = null;
     renderLogin();
   });
 
   bindViewEvents();
+
+  // 初始化懒加载
+  if (typeof observeLazyImages === "function") {
+    window.requestAnimationFrame(() => observeLazyImages());
+  }
+
   document.getElementById("reviewNoteForm")?.addEventListener("submit", (event) => {
     event.preventDefault();
     if (!state.reviewNoteDialog) return;
@@ -197,6 +208,18 @@ function renderApp() {
       if (typeof mountPostsMonitorPagination === 'function') mountPostsMonitorPagination();
     });
   }
+}
+
+function collectPostFormBuffer() {
+  const form = document.getElementById("postForm");
+  if (!form || state.editingPostId) return null;
+  const snapshot = {};
+  form.querySelectorAll("input, select, textarea").forEach((el) => {
+    if (!el.name || el.type === "file") return;
+    snapshot[el.name] = el.value;
+  });
+  state._postFormBuffer = snapshot;
+  return snapshot;
 }
 
 function renderFlash() {
@@ -252,6 +275,8 @@ function renderCurrentView() {
         return renderPersonalBoard();
       case "posts":
         return renderPostsMonitor();
+      case "staff-gallery":
+        return renderPostsGallery();
       case "account-viz":
         return renderAccountVisualization();
       case "leads":
@@ -314,6 +339,8 @@ function renderCurrentView() {
       return renderStaffRankings();
     case "personal-board":
       return renderStaffPersonalBoard();
+    case "staff-gallery":
+      return renderPostsGallery();
     case "post-entry":
       return renderPostEntry();
     case "staff-leads-board":
@@ -428,8 +455,22 @@ function bindViewEvents() {
   document.getElementById("employeeForm")?.addEventListener("submit", submitEmployee);
   document.getElementById("staffUserForm")?.addEventListener("submit", submitStaffUser);
   document.getElementById("accountForm")?.addEventListener("submit", submitAccount);
-  document.getElementById("postForm")?.addEventListener("submit", submitPost);
+  document.getElementById("postForm")?.addEventListener("submit", withSubmitLock("submitPost", submitPost));
   document.getElementById("leadForm")?.addEventListener("submit", withSubmitLock("submitLead", submitLead));
+
+  // 绑定表单自动保存
+  if (state.currentView === "post-entry" && !state.editingPostId) {
+    window.requestAnimationFrame(() => {
+      if (typeof bindFormAutoSave === "function") bindFormAutoSave("post", "#postForm");
+      if (typeof initDraftRestorePrompt === "function") initDraftRestorePrompt("post");
+    });
+  }
+  if ((state.currentView === "lead-entry" || state.currentView === "staff-leads-board") && !state.editingLeadId) {
+    window.requestAnimationFrame(() => {
+      if (typeof bindFormAutoSave === "function") bindFormAutoSave("lead", "#leadForm");
+      if (typeof initDraftRestorePrompt === "function") initDraftRestorePrompt("lead");
+    });
+  }
   document.querySelectorAll(".js-staff-posting-plan-form").forEach((form) => form.addEventListener("submit", submitStaffPostingPlan));
   document.querySelectorAll(".js-sales-feedback-form").forEach((form) => form.addEventListener("submit", submitSalesLead));
   document.querySelectorAll(".js-lead-note-form").forEach((form) => form.addEventListener("submit", withSubmitLock("submitNote", submitLeadNote)));
@@ -437,10 +478,26 @@ function bindViewEvents() {
   document.getElementById("leadCaptureInput")?.addEventListener("change", (event) => {
     const [file] = event.target.files || [];
     if (!file) return;
+    if (typeof collectLeadFormSnapshot === "function" && !state.editingLeadId) {
+      state._leadFormBuffer = collectLeadFormSnapshot() || state._leadFormBuffer || {};
+    }
     setPendingLeadCapture(file);
     // 图片选择后立刻保存一次草稿（不 debounce）
-    if (typeof saveLeadDraftNow === "function" && !state.editingLeadId) {
-      saveLeadDraftNow().catch((err) => console.warn("[lead-draft] save after image select failed", err));
+    if (typeof saveDraftNow === "function" && !state.editingLeadId) {
+      const form = document.getElementById("leadForm");
+      if (form) saveDraftNow("lead", form);
+    }
+    renderApp();
+  });
+  document.getElementById("postCoverInput")?.addEventListener("change", (event) => {
+    const [file] = event.target.files || [];
+    if (!file) return;
+    collectPostFormBuffer();
+    setPendingPostCover(file);
+    // 图片选择后立刻保存一次草稿（不 debounce）
+    if (typeof saveDraftNow === "function" && !state.editingPostId) {
+      const form = document.getElementById("postForm");
+      if (form) saveDraftNow("post", form);
     }
     renderApp();
   });
@@ -624,8 +681,11 @@ function bindViewEvents() {
     state.staffGalleryMonth = event.target.value;
     renderApp();
   });
-  document.getElementById("staffGalleryScopeInput")?.addEventListener("change", (event) => {
+  document.getElementById("staffGalleryScopeInput")?.addEventListener("change", async (event) => {
     state.staffGalleryScope = event.target.value;
+    if (event.target.value === "favorites" && typeof loadPlazaPosts === "function") {
+      await loadPlazaPosts("favorites");
+    }
     renderApp();
   });
   document.getElementById("staffGalleryPlatformFilter")?.addEventListener("change", (event) => {
@@ -638,6 +698,22 @@ function bindViewEvents() {
   });
   document.getElementById("staffGalleryEmployeeFilter")?.addEventListener("change", (event) => {
     state.staffGalleryEmployeeFilter = event.target.value;
+    renderApp();
+  });
+  document.getElementById("staffGalleryAccountFilter")?.addEventListener("change", (event) => {
+    state.staffGalleryAccountFilter = event.target.value;
+    renderApp();
+  });
+  document.getElementById("staffGalleryMinLeadsFilter")?.addEventListener("input", (event) => {
+    state.staffGalleryMinLeadsFilter = event.target.value;
+    renderApp();
+  });
+  document.getElementById("staffGalleryMinLikesFilter")?.addEventListener("input", (event) => {
+    state.staffGalleryMinLikesFilter = event.target.value;
+    renderApp();
+  });
+  document.getElementById("staffGallerySort")?.addEventListener("change", (event) => {
+    state.staffGallerySort = event.target.value;
     renderApp();
   });
   document.getElementById("staffRankingsModeInput")?.addEventListener("change", (event) => {
@@ -765,12 +841,6 @@ function bindViewEvents() {
       trafficInput.value = "";
     }
   });
-  document.getElementById("postCoverInput")?.addEventListener("change", (event) => {
-    const file = event.target.files && event.target.files[0];
-    if (!file) return;
-    setPendingPostCover(file);
-    renderApp();
-  });
   document.getElementById("postCoverPasteHint")?.addEventListener("paste", (event) => {
     const items = Array.from(event.clipboardData?.items || []);
     const imageItem = items.find((item) => String(item.type || "").startsWith("image/"));
@@ -778,6 +848,7 @@ function bindViewEvents() {
     event.preventDefault();
     const file = imageItem.getAsFile();
     if (!file) return;
+    collectPostFormBuffer();
     setPendingPostCover(file);
     setFlash("success", "封面已粘贴", "可以继续填写其他信息，提交时会一起上传这张封面。");
     renderApp();
@@ -791,6 +862,7 @@ function bindViewEvents() {
     event.preventDefault();
     const file = imageItem.getAsFile();
     if (!file) return;
+    collectPostFormBuffer();
     setPendingPostCover(file);
     setFlash("success", "封面已粘贴", "可以继续填写其他信息，提交时会一起上传这张封面。");
     renderApp();
@@ -822,11 +894,45 @@ function bindViewEvents() {
   document.querySelectorAll(".js-edit-post").forEach((el) => el.addEventListener("click", () => { clearPendingPostCover(); state.editingPostId = el.dataset.id; state.currentView = state.user.role === "admin" ? "posts" : "post-entry"; renderApp(); }));
   document.querySelectorAll(".js-delete-post").forEach((el) => el.addEventListener("click", () => deletePost(el.dataset.id)));
   document.querySelectorAll(".js-save-post-suggestion").forEach((el) => el.addEventListener("click", () => savePostSuggestion(el.dataset.id)));
+  document.querySelectorAll(".js-plaza-view-switch").forEach((el) => el.addEventListener("click", async () => {
+    const view = el.dataset.plazaView || "all";
+    state.plazaView = view;
+    if (typeof loadPlazaPosts === "function") {
+      await loadPlazaPosts(view);
+    }
+    renderApp();
+  }));
+  document.querySelectorAll(".js-toggle-favorite-post").forEach((el) => el.addEventListener("click", () => toggleFavoritePost(el)));
   document.getElementById("rollbackSnapshotDateInput")?.addEventListener("change", (event) => {
     state.rollbackSnapshotDate = event.target.value;
   });
   document.getElementById("refreshScopedMetricsBtn")?.addEventListener("click", refreshScopedMetrics);
   document.getElementById("rollbackScopedMetricsBtn")?.addEventListener("click", rollbackScopedMetrics);
+  document.querySelectorAll(".js-refresh-post-metrics").forEach((el) => el.addEventListener("click", () => handleRefreshPostMetricsClick(el)));
+  document.getElementById("batchRefreshFilteredPostsBtn")?.addEventListener("click", handleBatchRefreshFilteredPosts);
+  document.querySelector(".js-retry-failed-post-refresh")?.addEventListener("click", retryFailedPostRefreshes);
+  document.querySelector(".js-clear-post-refresh-failures")?.addEventListener("click", () => {
+    state.postBatchRefreshFailures = [];
+    renderApp();
+  });
+  document.getElementById("openPostBulkImportBtn")?.addEventListener("click", () => {
+    state.postBulkImportOpen = true;
+    state.postBulkImportRaw = "";
+    state.postBulkImportResult = null;
+    renderApp();
+  });
+  document.getElementById("postBulkImportSubmitBtn")?.addEventListener("click", submitPostBulkImport);
+  document.getElementById("postBulkImportFileSubmitBtn")?.addEventListener("click", submitPostBulkImportFile);
+  document.getElementById("postBulkImportCloseBtn")?.addEventListener("click", closePostBulkImportDialog);
+  document.querySelectorAll(".js-close-post-bulk-import").forEach((el) => el.addEventListener("click", closePostBulkImportDialog));
+  document.querySelectorAll(".js-post-bulk-delimiter").forEach((el) => {
+    el.addEventListener("change", () => {
+      document.querySelectorAll(".js-post-bulk-delimiter").forEach((item) => {
+        if (item !== el) item.checked = false;
+      });
+      el.checked = true;
+    });
+  });
   document.querySelectorAll(".js-edit-lead").forEach((el) => el.addEventListener("click", () => { clearPendingLeadCapture(); state.editingLeadId = el.dataset.id; state.currentView = state.user.role === "admin" ? "leads" : state.user.role === "sales" ? "sales-leads" : "lead-entry"; renderApp(); }));
   document.querySelectorAll(".js-edit-followup").forEach((el) => el.addEventListener("click", () => {
     clearPendingLeadCapture();
@@ -852,7 +958,13 @@ function bindViewEvents() {
   document.querySelectorAll(".js-lead-intention").forEach((el) => el.addEventListener("change", () => updateLeadBoardState(el.dataset.id, { intention: el.value || "" })));
   document.querySelectorAll(".js-sales-process-select").forEach((el) => el.addEventListener("change", () => updateLeadBoardState(el.dataset.id, { processStatus: el.value || "not_contacted" })));
   document.querySelectorAll(".js-sales-process-toggle").forEach((el) => el.addEventListener("change", () => updateLeadBoardState(el.dataset.id, { processStatus: el.checked ? "applied" : "not_contacted" })));
-  document.querySelectorAll(".js-sales-add-toggle").forEach((el) => el.addEventListener("change", () => updateLeadBoardState(el.dataset.id, { addStatus: el.checked ? "已添加" : "未添加" })));
+  document.querySelectorAll(".js-sales-add-toggle").forEach((el) => el.addEventListener("change", async () => {
+    const addStatus = el.checked ? "added" : "not_added";
+    await updateLeadBoardState(el.dataset.id, { addStatus });
+    if (state.user?.role === "sales" && addStatus === "added" && typeof openSalesLeadDetail === "function") {
+      openSalesLeadDetail(el.dataset.id);
+    }
+  }));
   document.querySelectorAll(".js-lead-intention-level").forEach((el) => el.addEventListener("change", () => updateLeadBoardState(el.dataset.id, { intentionLevel: el.value || "pending" })));
   document.querySelectorAll(".js-lead-process-status").forEach((el) => el.addEventListener("change", () => updateLeadBoardState(el.dataset.id, { processStatus: el.value || "not_contacted" })));
   document.querySelectorAll(".js-lead-next-follow").forEach((el) => el.addEventListener("change", () => updateLeadBoardState(el.dataset.id, { nextFollowTime: el.value || null })));
@@ -908,7 +1020,7 @@ function bindViewEvents() {
     button.addEventListener("click", () => {
       state.staffGalleryEmployeeFilter = button.dataset.owner || "";
       state.staffGalleryScope = "all";
-      state.currentView = "gallery";
+      state.currentView = "staff-gallery";
       renderApp();
     });
   });

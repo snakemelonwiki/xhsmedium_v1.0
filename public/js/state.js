@@ -35,6 +35,10 @@ const state = {
   postMonitorWeek: getCurrentWeekString(),
   postMonitorMode: "day",
   postMonitorSort: "time",
+  postBatchRefreshFailures: [],
+  postBulkImportOpen: false,
+  postBulkImportRaw: "",
+  postBulkImportResult: null,
   leadMonitorDate: new Date().toLocaleDateString("en-CA"),
   leadMonitorWeek: getCurrentWeekString(),
   leadMonitorMode: "day",
@@ -43,9 +47,15 @@ const state = {
   staffGalleryWeek: getCurrentWeekString(),
   staffGalleryMode: "week",
   staffGalleryScope: "all",
+  plazaView: "all",
+  plazaPosts: [],
   staffGalleryPlatformFilter: "",
   staffGalleryTypeFilter: "",
   staffGalleryEmployeeFilter: "",
+  staffGalleryAccountFilter: "",
+  staffGalleryMinLeadsFilter: "",
+  staffGalleryMinLikesFilter: "",
+  staffGallerySort: "score",
   staffRankingsDate: new Date().toLocaleDateString("en-CA"),
   staffRankingsMonth: new Date().toLocaleDateString("en-CA").slice(0, 7),
   staffRankingsWeek: getCurrentWeekString(),
@@ -73,6 +83,7 @@ const state = {
   leadDraftId: null,
   leadDraftRestorePrompt: null,
   pendingLeadCapture: null,
+  draftRestorePrompt: null,
   flash: null,
   viewContext: null,
   summary: null,
@@ -82,8 +93,10 @@ const state = {
   employees: [],
   accounts: [],
   posts: [],
+  postTotal: 0,
   teamPosts: [],
   leads: [],
+  leadTotal: 0,
   teamLeads: [],
   analyticsSnapshots: {},
   staffLearningPostIds: [],
@@ -272,16 +285,45 @@ function saveSalesTomorrowFollowupIds() {
   localStorage.setItem(getSalesTomorrowFollowupsStorageKey(), JSON.stringify(state.salesTomorrowFollowupIds || []));
 }
 
-function toggleStaffLearningPost(postId) {
-  if (!postId) return;
-  const exists = state.staffLearningPostIds.includes(postId);
-  state.staffLearningPostIds = exists
-    ? state.staffLearningPostIds.filter((item) => item !== postId)
-    : [postId, ...state.staffLearningPostIds];
-  saveStaffLearningPostIds();
-  setFlash("success", exists ? "已移出学习清单" : "已加入学习清单", exists ? "这条作品已经从你的学习清单里移除。" : "这条作品已经加入学习清单，后面可以反复回看。");
-  renderApp();
+async function loadFavoritePostIds() {
+  const localIds = loadStaffLearningPostIds();
+  try {
+    if (localIds.length) {
+      await api("/api/favorites/sync", {
+        method: "POST",
+        body: JSON.stringify({ targetType: "post", targetIds: localIds })
+      });
+    }
+    const result = await api("/api/favorites?targetType=post");
+    const ids = Array.isArray(result?.ids) ? result.ids : [];
+    state.staffLearningPostIds = ids;
+    saveStaffLearningPostIds();
+    return ids;
+  } catch {
+    return localIds;
+  }
 }
 
-
+async function toggleStaffLearningPost(postId) {
+  if (!postId) return;
+  const exists = state.staffLearningPostIds.includes(postId);
+  try {
+    const result = await api("/api/favorites/toggle", {
+      method: "POST",
+      body: JSON.stringify({ targetType: "post", targetId: postId })
+    });
+    const nextSaved = Boolean(result?.favorited);
+    state.staffLearningPostIds = nextSaved
+      ? [postId, ...state.staffLearningPostIds.filter((item) => item !== postId)]
+      : state.staffLearningPostIds.filter((item) => item !== postId);
+  } catch {
+    state.staffLearningPostIds = exists
+      ? state.staffLearningPostIds.filter((item) => item !== postId)
+      : [postId, ...state.staffLearningPostIds];
+  }
+  saveStaffLearningPostIds();
+  const isSaved = state.staffLearningPostIds.includes(postId);
+  setFlash("success", isSaved ? "已加入学习清单" : "已移出学习清单", isSaved ? "这条作品已经加入学习清单，后面可以反复回看。" : "这条作品已经从你的学习清单里移除。");
+  renderApp();
+}
 
