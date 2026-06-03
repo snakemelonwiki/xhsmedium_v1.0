@@ -1,50 +1,62 @@
-import { Controller, Get, Post, Put, Delete, Body, Param, Query, Req, Res } from '@nestjs/common';
+import { Controller, Get, Post, Put, Patch, Delete, Body, Param, Query, Req, Res } from '@nestjs/common';
 import { AccountsService } from './accounts.service';
 import { Request, Response } from 'express';
 import { makeId } from '../../shared/utils/id-generator';
+import { OperationLogsService } from '../operation-logs/operation-logs.service';
+import { getSessionUserId } from '../../common/session.utils';
+import {
+  OPERATION_LOG_ACTIONS,
+  OPERATION_LOG_TARGET_TYPES,
+  parseIp,
+  stringifyDetail,
+} from '../../shared/operation-logs.constants';
 
 @Controller('accounts')
 export class AccountsController {
-  constructor(private readonly accountsService: AccountsService) {}
+  constructor(
+    private readonly accountsService: AccountsService,
+    private readonly operationLogs: OperationLogsService,
+  ) {}
 
+  /**
+   * 查询账号列表，运营角色仅返回本人名下账号，支持按平台过滤。
+   */
   @Get()
   async findAll(
+    @Req() req: Request,
     @Res() res: Response,
     @Query('limit') limit?: string,
     @Query('offset') offset?: string,
     @Query('keyword') keyword?: string,
     @Query('search') search?: string,
     @Query('q') q?: string,
+    @Query('platform') platform?: string,
   ) {
     const wantsPaging = limit !== undefined || offset !== undefined;
     const nextKeyword = keyword || search || q || '';
+    const nextPlatform = (platform || '').trim();
+    const scopedEmployeeId = this.resolveScopedEmployeeId(req);
     if (wantsPaging) {
       const result = await this.accountsService.findAllPaged(
         Number(limit) || 20,
         Number(offset) || 0,
         nextKeyword,
+        nextPlatform,
+        scopedEmployeeId,
       );
       return res.json(result);
     }
-    const rows = await this.accountsService.findAll(nextKeyword);
-    return res.json(rows.map((r) => ({
-      id: r.id,
-      employeeId: r.employeeId,
-      platform: r.platform,
-      profileUrl: r.profileUrl,
-      accountName: r.accountName,
-      accountUid: r.accountUid,
-      persona: r.persona,
-      positioning: r.positioning,
-      postingPlan: r.postingPlan || '',
-      status: r.status,
-      createdAt: r.createdAt,
-      updatedAt: r.updatedAt,
-    })));
+    const rows = await this.accountsService.findAll(nextKeyword, nextPlatform, scopedEmployeeId);
+    // findAll() 已经返回完整 mapAccount 输出（含 employeeName），直接透传即可
+    return res.json(rows);
   }
 
+  /**
+   * 创建账号资料。
+   */
   @Post()
-  async create(@Body() body: any, @Res() res: Response) {
+  async create(@Body() body: any, @Req() req: Request, @Res() res: Response) {
+    const userId = getSessionUserId(req);
     const account = await this.accountsService.create({
       id: makeId(),
       employeeId: body.employeeId,
@@ -57,11 +69,122 @@ export class AccountsController {
       postingPlan: body.postingPlan || '',
       status: body.status || '正常',
     });
+    // 写操作日志：账号创建
+    try {
+      await this.operationLogs.log({
+        userId,
+        action: OPERATION_LOG_ACTIONS.CREATE,
+        targetType: OPERATION_LOG_TARGET_TYPES.ACCOUNT,
+        targetId: (account as any)?.id || '',
+        detail: stringifyDetail({
+          platform: body.platform,
+          accountName: body.accountName,
+        }),
+        ip: parseIp(req),
+      });
+    } catch (logErr) {
+      // eslint-disable-next-line no-console
+      console.error('[accounts] operation log failed', (logErr as any)?.message || logErr);
+    }
     return res.json({ ok: true });
   }
 
+  /**
+   * 更新账号启停状态，运营角色只能修改本人名下账号。
+   * E/P1-01: 把"停用/异常/注销"类 status 变更归到 OPERATION_LOG_ACTIONS.DISABLE，
+   * 其余 status 变更（正常/封禁 等）按 UPDATE 记录。
+   */
+  @Patch(':id/status')
+  async updateStatus(@Param('id') id: string, @Body() body: any, @Req() req: Request, @Res() res: Response) {
+    const denied = await this.ensureCanWriteAccount(id, body, req, res);
+    if (denied) return denied;
+    const userId = getSessionUserId(req);
+    const before = await this.accountsService.findById(id);
+    await this.accountsService.updateStatus(id, body.status);
+    const nextStatus = String(body.status || '').trim();
+    const isDisable = ['停用', '异常', '注销', 'inactive', 'disabled', '封禁', 'banned'].includes(nextStatus);
+    try {
+      await this.operationLogs.log({
+        userId,
+        action: isDisable ? OPERATION_LOG_ACTIONS.DISABLE : OPERATION_LOG_ACTIONS.UPDATE,
+        targetType: OPERATION_LOG_TARGET_TYPES.ACCOUNT,
+        targetId: id,
+        detail: stringifyDetail({
+          from: before?.status || null,
+          to: nextStatus || null,
+          accountName: before?.accountName || null,
+          platform: before?.platform || null,
+        }),
+        ip: parseIp(req),
+      });
+    } catch (logErr) {
+      // eslint-disable-next-line no-console
+      console.error('[accounts] operation log failed', (logErr as any)?.message || logErr);
+    }
+    return res.json({ ok: true });
+  }
+
+  /**
+   * 更新账号资料，运营角色只能修改本人名下账号。
+   */
   @Put(':id')
-  async update(@Param('id') id: string, @Body() body: any, @Res() res: Response) {
+  async update(@Param('id') id: string, @Body() body: any, @Req() req: Request, @Res() res: Response) {
+    return this.updateAccount(id, body, req, res);
+  }
+
+  /**
+   * 兼容 PATCH 方式更新账号资料。
+   */
+  @Patch(':id')
+  async patch(@Param('id') id: string, @Body() body: any, @Req() req: Request, @Res() res: Response) {
+    return this.updateAccount(id, body, req, res);
+  }
+
+  /**
+   * 更新账号发布计划。
+   */
+  @Put(':id/posting-plan')
+  async updatePostingPlan(@Param('id') id: string, @Body() body: any, @Res() res: Response) {
+    await this.accountsService.updatePostingPlan(id, body.postingPlan);
+    return res.json({ ok: true });
+  }
+
+  /**
+   * 删除账号。
+   * E/P1-01: 写一条 DELETE 操作日志（targetType=account），与 leads/employees 保持口径一致。
+   */
+  @Delete(':id')
+  async remove(@Param('id') id: string, @Req() req: Request, @Res() res: Response) {
+    const userId = getSessionUserId(req);
+    const before = await this.accountsService.findById(id);
+    await this.accountsService.remove(id);
+    try {
+      await this.operationLogs.log({
+        userId,
+        action: OPERATION_LOG_ACTIONS.DELETE,
+        targetType: OPERATION_LOG_TARGET_TYPES.ACCOUNT,
+        targetId: id,
+        detail: stringifyDetail({
+          accountName: before?.accountName || null,
+          platform: before?.platform || null,
+          employeeId: before?.employeeId || null,
+        }),
+        ip: parseIp(req),
+      });
+    } catch (logErr) {
+      // eslint-disable-next-line no-console
+      console.error('[accounts] operation log failed', (logErr as any)?.message || logErr);
+    }
+    return res.json({ ok: true });
+  }
+
+  /**
+   * 执行账号资料更新并复用写权限校验。
+   */
+  private async updateAccount(id: string, body: any, req: Request, res: Response) {
+    const userId = getSessionUserId(req);
+    const denied = await this.ensureCanWriteAccount(id, body, req, res);
+    if (denied) return denied;
     await this.accountsService.update(id, {
       employeeId: body.employeeId,
       platform: body.platform,
@@ -73,18 +196,51 @@ export class AccountsController {
       postingPlan: body.postingPlan,
       status: body.status,
     });
+    // 写操作日志：账号更新
+    try {
+      await this.operationLogs.log({
+        userId,
+        action: OPERATION_LOG_ACTIONS.UPDATE,
+        targetType: OPERATION_LOG_TARGET_TYPES.ACCOUNT,
+        targetId: id,
+        detail: stringifyDetail({
+          platform: body.platform,
+          accountName: body.accountName,
+          status: body.status,
+        }),
+        ip: parseIp(req),
+      });
+    } catch (logErr) {
+      // eslint-disable-next-line no-console
+      console.error('[accounts] operation log failed', (logErr as any)?.message || logErr);
+    }
     return res.json({ ok: true });
   }
 
-  @Put(':id/posting-plan')
-  async updatePostingPlan(@Param('id') id: string, @Body() body: any, @Res() res: Response) {
-    await this.accountsService.updatePostingPlan(id, body.postingPlan);
-    return res.json({ ok: true });
+  /**
+   * 校验当前请求是否只能访问某个员工名下账号。
+   */
+  private resolveScopedEmployeeId(req: Request): string | undefined {
+    const session = (req as any)?.session || {};
+    if (session.role === 'staff' || session.role === 'operation') {
+      return session.employeeId || '';
+    }
+    return undefined;
   }
 
-  @Delete(':id')
-  async remove(@Param('id') id: string, @Res() res: Response) {
-    await this.accountsService.remove(id);
-    return res.json({ ok: true });
+  /**
+   * 校验运营角色写账号时不能越过本人 employeeId。
+   */
+  private async ensureCanWriteAccount(id: string, body: any, req: Request, res: Response) {
+    const scopedEmployeeId = this.resolveScopedEmployeeId(req);
+    if (scopedEmployeeId === undefined) return null;
+    const account = await this.accountsService.findById(id);
+    if (!account) {
+      return res.status(404).json({ ok: false, message: '账号不存在' });
+    }
+    if (account.employeeId !== scopedEmployeeId || (body.employeeId !== undefined && body.employeeId !== scopedEmployeeId)) {
+      return res.status(403).json({ ok: false, message: '无权修改该账号' });
+    }
+    return null;
   }
 }

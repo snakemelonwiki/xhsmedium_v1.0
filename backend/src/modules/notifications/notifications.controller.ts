@@ -1,8 +1,11 @@
-import { Controller, Get, Post, Patch, Param, Req, Res, Query, Body } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Param, Req, Res, Query, Body, UseGuards } from '@nestjs/common';
 import { NotificationsService } from './notifications.service';
 import { Request, Response } from 'express';
+import { AuthGuard } from '../../common/auth.guard';
+import { getSessionUserId } from '../../common/session.utils';
 
 @Controller('notifications')
+@UseGuards(AuthGuard)
 export class NotificationsController {
   constructor(private readonly notificationsService: NotificationsService) {}
 
@@ -14,7 +17,7 @@ export class NotificationsController {
   ) {
     const session = (req as any).session;
     const user = (req as any).user;
-    const userId = session?.userId || session?.id || user?.sub || user?.id || actorUserId || '';
+    const userId = getSessionUserId(req) || actorUserId || '';
     const userRole = session?.role || user?.role || 'staff';
     const portType = this.resolvePortType(userRole);
     const unreadCount = await this.notificationsService.countUnread(userId, portType);
@@ -33,7 +36,7 @@ export class NotificationsController {
   ) {
     const session = (req as any).session;
     const user = (req as any).user;
-    const userId = session?.userId || session?.id || user?.sub || user?.id || actorUserId || '';
+    const userId = getSessionUserId(req) || actorUserId || '';
     const userRole = session?.role || user?.role || 'staff';
 
     const portType = this.resolvePortType(userRole);
@@ -63,7 +66,7 @@ export class NotificationsController {
     @Res() res: Response,
   ) {
     const session = (req as any).session;
-    const userId = session?.userId || session?.id || body?.actorUserId || '';
+    const userId = getSessionUserId(req) || body?.actorUserId || '';
     const ok = await this.notificationsService.markRead(id, userId);
     return res.json({ ok, changed: ok });
   }
@@ -76,7 +79,7 @@ export class NotificationsController {
     @Res() res: Response,
   ) {
     const session = (req as any).session;
-    const userId = session?.userId || session?.id || body?.actorUserId || '';
+    const userId = getSessionUserId(req) || body?.actorUserId || '';
     const ok = await this.notificationsService.markRead(id, userId);
     return res.json({ ok, changed: ok });
   }
@@ -88,8 +91,47 @@ export class NotificationsController {
     @Res() res: Response,
   ) {
     const session = (req as any).session;
-    const userId = session?.userId || session?.id || body?.actorUserId || '';
+    const userId = getSessionUserId(req) || body?.actorUserId || '';
     const affected = await this.notificationsService.markAllRead(userId);
+    return res.json({ ok: true, affected });
+  }
+
+  /**
+   * Batch mark notifications as read.
+   * Body: { ids: string[] } — accepts either an explicit list of notification ids
+   * or { all: true } to mark every unread notification of the current user.
+   */
+  @Post('mark-read')
+  async markReadMany(
+    @Body() body: any,
+    @Req() req: Request,
+    @Res() res: Response,
+  ) {
+    const session = (req as any).session;
+    const userId = getSessionUserId(req) || body?.actorUserId || '';
+    const rawIds = Array.isArray(body?.ids) ? body.ids : [];
+    const ids: string[] = rawIds
+      .map((id: unknown) => (id == null ? '' : String(id).trim()))
+      .filter((id: string) => id.length > 0);
+    const affected = await this.notificationsService.markReadMany(userId, ids);
+    return res.json({ ok: true, affected });
+  }
+
+  /**
+   * Mark every unread notification of the current user as read.
+   * Body (optional): { typeCode?: string } — when provided, only notifications
+   * matching that type are marked read.
+   */
+  @Post('mark-all-read')
+  async markAllReadByType(
+    @Body() body: any,
+    @Req() req: Request,
+    @Res() res: Response,
+  ) {
+    const session = (req as any).session;
+    const userId = getSessionUserId(req) || body?.actorUserId || '';
+    const typeCode = body?.typeCode ? String(body.typeCode).trim() : undefined;
+    const affected = await this.notificationsService.markAllRead(userId, typeCode || undefined);
     return res.json({ ok: true, affected });
   }
 

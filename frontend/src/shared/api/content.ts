@@ -174,11 +174,14 @@ export async function listGalleryPosts(query: PageQuery = {}): Promise<PagedResu
     const paged = normalizePagedResult<RawRecord>(payload);
     return { ...paged, page, pageSize, items: paged.items.map(mapPost) };
   } catch {
+    // Fallback to /posts/plaza endpoint which now supports server-side pagination
     const payload = await apiClient.get<unknown>('/posts/plaza', {
-      query: { view: 'all', ...query },
+      query: { view: 'all', page, pageSize },
     });
-    const items = rawItems(payload).slice(offset, offset + limit).map(mapPost);
-    return { items, total: rawItems(payload).length, page, pageSize };
+    const data = payload as { items?: unknown[]; rows?: unknown[]; total?: number };
+    const items = rawItems(data).map(mapPost);
+    const total = Number(data?.total ?? items.length);
+    return { items, total, page, pageSize };
   }
 }
 
@@ -211,10 +214,15 @@ export async function togglePostFavorite(postId: string): Promise<FavoriteToggle
   };
 }
 
-export async function listRankings(type: 'posts' | 'leads' = 'posts', query: PageQuery = {}): Promise<PagedResult<RankingRow>> {
+export async function listRankings(type: string = 'posts', query: PageQuery = {}): Promise<PagedResult<RankingRow>> {
   const { page, pageSize, limit, offset } = withPaging(query);
+  const filters = { ...query };
+  delete filters.page;
+  delete filters.pageSize;
+  delete filters.limit;
+  delete filters.offset;
   const payload = await apiClient.get<unknown>('/rankings', {
-    query: { type, limit, offset },
+    query: { ...filters, type, limit, offset },
   });
   const paged = normalizePagedResult<RawRecord>(payload);
   return {

@@ -10,7 +10,7 @@ describe('LeadsController', () => {
     const leadsService = {
       findFilteredPaged: jest.fn().mockResolvedValue({ total: 21, items: [{ id: 'lead-1' }], limit: 20, offset: 0 }),
     } as any;
-    const controller = new LeadsController(leadsService, {} as any);
+    const controller = new LeadsController(leadsService, {} as any, { log: jest.fn() } as any, { create: jest.fn() } as any);
     const res = response();
 
     await controller.findAll(
@@ -39,7 +39,7 @@ describe('LeadsController', () => {
       canAccessLead: jest.fn().mockResolvedValue(true),
       updateSalesStatus: jest.fn().mockResolvedValue({ id: 'lead-1', addStatus: 'added', status: 'added_success' }),
     } as any;
-    const controller = new LeadsController(leadsService, {} as any);
+    const controller = new LeadsController(leadsService, {} as any, { log: jest.fn() } as any, { create: jest.fn() } as any);
     const res = response();
 
     await controller.updateStatus(
@@ -60,6 +60,26 @@ describe('LeadsController', () => {
     });
   });
 
+  it('returns 422 from PUT /leads/:id/board when service rejects invalid board state', async () => {
+    const leadsService = {
+      canAccessLead: jest.fn().mockResolvedValue(true),
+      updateBoard: jest.fn().mockRejectedValue(new Error('invalid addStatus: bad')),
+    } as any;
+    const controller = new LeadsController(leadsService, {} as any, { log: jest.fn() } as any, { create: jest.fn() } as any);
+    const res = response();
+
+    await controller.updateBoard(
+      'lead-1',
+      { addStatus: 'bad' },
+      undefined,
+      { session: { role: 'sales', userId: 'sales-1' } } as any,
+      res,
+    );
+
+    expect(res.status).toHaveBeenCalledWith(422);
+    expect(res.json).toHaveBeenCalledWith({ ok: false, message: 'invalid addStatus: bad' });
+  });
+
   it('creates collaboration task from lead route', async () => {
     const collaborationTasksService = {
       create: jest.fn().mockResolvedValue({ id: 'task-1', leadId: 'lead-1' }),
@@ -67,7 +87,7 @@ describe('LeadsController', () => {
     const leadsService = {
       canAccessLead: jest.fn().mockResolvedValue(true),
     } as any;
-    const controller = new LeadsController(leadsService, collaborationTasksService);
+    const controller = new LeadsController(leadsService, collaborationTasksService, { log: jest.fn() } as any, { create: jest.fn() } as any);
     const res = response();
 
     await controller.createCollaboration(

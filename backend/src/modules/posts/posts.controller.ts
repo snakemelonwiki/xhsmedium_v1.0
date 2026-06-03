@@ -1,16 +1,25 @@
-import { Controller, Get, Post, Put, Delete, Body, Param, Query, Req, Res, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Put, Patch, Delete, Body, Param, Query, Req, Res, UseGuards } from '@nestjs/common';
 import { PostsService } from './posts.service';
 import { PostsMetricsService } from './posts-metrics.service';
 import { Request, Response } from 'express';
 import { makeId } from '../../shared/utils/id-generator';
 import { todayString } from '../../shared/utils/date-utils';
 import { DebounceGuard } from '../../common/debounce.guard';
+import { OperationLogsService } from '../operation-logs/operation-logs.service';
+import { getSessionUserId } from '../../common/session.utils';
+import {
+  OPERATION_LOG_ACTIONS,
+  OPERATION_LOG_TARGET_TYPES,
+  parseIp,
+  stringifyDetail,
+} from '../../shared/operation-logs.constants';
 
 @Controller('posts')
 export class PostsController {
   constructor(
     private readonly postsService: PostsService,
     private readonly postsMetricsService: PostsMetricsService,
+    private readonly operationLogs: OperationLogsService,
   ) {}
 
   @Get()
@@ -26,9 +35,13 @@ export class PostsController {
     @Query('from') from?: string,
     @Query('to') to?: string,
     @Query('sort') sort?: string,
+    @Query('search') search?: string,
+    @Query('keyword') keyword?: string,
+    @Query('q') q?: string,
   ) {
     const session = (req as any).session;
     const wantsPaging = limit !== undefined || offset !== undefined;
+    const nextSearch = (search || keyword || q || '').trim();
 
     if (wantsPaging) {
       if (session?.role === 'staff' && session?.employeeId) {
@@ -41,6 +54,7 @@ export class PostsController {
             from,
             to,
             sort,
+            search: nextSearch,
           },
           Number(limit) || 20,
           Number(offset) || 0,
@@ -56,6 +70,7 @@ export class PostsController {
           from,
           to,
           sort,
+          search: nextSearch,
         },
         Number(limit) || 20,
         Number(offset) || 0,
@@ -72,6 +87,18 @@ export class PostsController {
   }
 
   /**
+   * 解析作品链接，识别平台并返回可回填的基础字段。
+   */
+  @Post('parse-link')
+  async parseLink(@Body() body: any, @Res() res: Response) {
+    const postUrl = String(body?.postUrl || body?.url || '').trim();
+    if (!postUrl) {
+      return res.status(400).json({ ok: false, message: '作品链接不能为空' });
+    }
+    return res.json({ ok: true, data: this.postsService.parsePostLink(postUrl) });
+  }
+
+  /**
    * 作品广场：
    * - staff 强制只看优秀作品（获客数 >= 5）
    * - admin/owner 可切换 all/excellent/favorites
@@ -85,30 +112,42 @@ export class PostsController {
     @Query('platform') platform?: string,
     @Query('postType') postType?: string,
     @Query('employeeId') employeeId?: string,
+    @Query('page') page?: string,
+    @Query('pageSize') pageSize?: string,
   ) {
     const session = (req as any).session;
     const role = session?.role || '';
-    const userId = session?.userId || session?.id || '';
+    const userId = getSessionUserId(req);
     const allowedViews = new Set(['all', 'excellent', 'favorites']);
     const requestedView = allowedViews.has(String(view || '').toLowerCase())
       ? String(view || '').toLowerCase()
       : 'all';
     const effectiveView = role === 'staff' ? 'excellent' : requestedView;
 
-    const rows = await this.postsService.findPlaza({
-      view: effectiveView as 'all' | 'excellent' | 'favorites',
-      platform: platform || undefined,
-      postType: postType || undefined,
-      employeeId: employeeId || undefined,
-      userId,
-    });
-    return res.json({ ok: true, view: effectiveView, rows });
+    const result = await this.postsService.findPlaza(
+      {
+        view: effectiveView as 'all' | 'excellent' | 'favorites',
+        platform: platform || undefined,
+        postType: postType || undefined,
+        employeeId: employeeId || undefined,
+        userId,
+      },
+      Number(page) || 1,
+      Number(pageSize) || 20,
+    );
+    return res.json({ ok: true, view: effectiveView, ...result });
   }
 
   @Post()
   @UseGuards(DebounceGuard)
   async create(@Body() body: any, @Req() req: Request, @Res() res: Response) {
     const session = (req as any).session;
+    const duplicate = body?.postUrl
+      ? await this.postsService.findDuplicateByUrl(body.postUrl)
+      : null;
+    if (duplicate) {
+      return res.status(409).json({ ok: false, message: '作品链接已存在', duplicate });
+    }
     const postId = makeId();
     await this.postsService.create({
       id: postId,
@@ -132,6 +171,20 @@ export class PostsController {
     return res.json({ ok: true });
   }
 
+  // 注意：批量导入模板下载必须位于 `:id` 路由之前，否则 NestJS 会把
+  // `import-template.xlsx` 当作 :id 命中 findOne 并返回"作品不存在"。
+  @Get('import-template.xlsx')
+  async downloadImportTemplate(@Res() res: Response) {
+    const BOM = '﻿';
+    const csv =
+      BOM +
+      '平台,标题,作品类型,作品链接,账号ID,发布时间,文案,封面URL,流量,点赞,评论,收藏,备注\n' +
+      '小红书,示例作品,获客贴,https://example.com,,2026-05-31,示例文案,,0,0,0,0,备注\n';
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="posts_import_template.csv"');
+    return res.send(csv);
+  }
+
   @Get(':id')
   async findOne(@Param('id') id: string, @Res() res: Response) {
     const post = await this.postsService.findById(id);
@@ -142,6 +195,50 @@ export class PostsController {
   @Put(':id')
   @UseGuards(DebounceGuard)
   async update(@Param('id') id: string, @Body() body: any, @Req() req: Request, @Res() res: Response) {
+    return this.updatePost(id, body, req, res);
+  }
+
+  /**
+   * 兼容 v1.2 接口契约，PATCH 与 PUT 共享作品更新逻辑。
+   */
+  @Patch(':id')
+  @UseGuards(DebounceGuard)
+  async patch(@Param('id') id: string, @Body() body: any, @Req() req: Request, @Res() res: Response) {
+    return this.updatePost(id, body, req, res);
+  }
+
+  /**
+   * 手动写入作品指标，并保存一条历史快照。
+   */
+  @Post(':id/metrics')
+  async saveMetrics(@Param('id') id: string, @Body() body: any, @Res() res: Response) {
+    const post = await this.postsService.findById(id);
+    if (!post) return res.status(404).json({ message: '作品不存在' });
+    const metrics = {
+      likes: Number(body?.likes || 0),
+      comments: Number(body?.comments || 0),
+      favorites: Number(body?.favorites || 0),
+      shares: Number(body?.shares || 0),
+      metricsUpdatedAt: new Date(),
+    };
+    await this.postsService.updateMetrics(id, metrics);
+    await this.postsService.recordMetricsHistory(id, metrics);
+    return res.json({ ok: true });
+  }
+
+  /**
+   * 读取作品指标历史，用于作品详情和主管看板查看趋势。
+   */
+  @Get(':id/metrics')
+  async getMetrics(@Param('id') id: string, @Res() res: Response) {
+    const items = await this.postsService.getMetricsHistory(id);
+    return res.json({ items });
+  }
+
+  /**
+   * 更新作品基础字段，并对 staff 做归属校验。
+   */
+  private async updatePost(id: string, body: any, req: Request, res: Response) {
     const session = (req as any).session;
     if (session?.role === 'staff') {
       const post = await this.postsService.findById(id);
@@ -149,6 +246,12 @@ export class PostsController {
       if (post.employeeId !== session.employeeId) {
         return res.status(403).json({ ok: false, message: '无权操作他人作品' });
       }
+    }
+    const duplicate = body?.postUrl
+      ? await this.postsService.findDuplicateByUrl(body.postUrl, id)
+      : null;
+    if (duplicate) {
+      return res.status(409).json({ ok: false, message: '作品链接已存在', duplicate });
     }
     await this.postsService.update(id, {
       accountId: body.accountId,
@@ -240,7 +343,26 @@ export class PostsController {
         return res.status(403).json({ ok: false, message: '无权操作他人作品' });
       }
     }
+    // E/P1-01: 写一条 DELETE 操作日志（targetType=post）。
+    const before = await this.postsService.findById(id);
     await this.postsService.remove(id);
+    try {
+      await this.operationLogs.log({
+        userId: getSessionUserId(req),
+        action: OPERATION_LOG_ACTIONS.DELETE,
+        targetType: OPERATION_LOG_TARGET_TYPES.POST,
+        targetId: id,
+        detail: stringifyDetail({
+          title: before?.title || null,
+          platform: before?.platform || null,
+          employeeId: before?.employeeId || null,
+        }),
+        ip: parseIp(req),
+      });
+    } catch (logErr) {
+      // eslint-disable-next-line no-console
+      console.error('[posts] operation log failed', (logErr as any)?.message || logErr);
+    }
     return res.json({ ok: true });
   }
 }

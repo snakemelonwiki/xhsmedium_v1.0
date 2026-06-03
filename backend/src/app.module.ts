@@ -3,6 +3,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { JwtModule } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
+import { ScheduleModule } from '@nestjs/schedule';
 import { APP_INTERCEPTOR } from '@nestjs/core';
 import { User } from './entities/user.entity';
 import { Employee } from './entities/employee.entity';
@@ -14,6 +15,7 @@ import { LeadDraft } from './entities/lead-draft.entity';
 import { CollaborationTask } from './entities/collaboration-task.entity';
 import { Order } from './entities/order.entity';
 import { OrderFollowRecord } from './entities/order-follow-record.entity';
+import { OrderAbnormalFeedback } from './modules/orders/entities/order-abnormal-feedback.entity';
 import { ImportTask } from './entities/import-task.entity';
 import { Notification } from './entities/notification.entity';
 import { Favorite } from './entities/favorite.entity';
@@ -39,8 +41,10 @@ import { ToolsModule } from './modules/tools/tools.module';
 import { AnalyticsModule } from './modules/analytics/analytics.module';
 import { ExportsModule } from './modules/exports/exports.module';
 import { OperationLogsModule } from './modules/operation-logs/operation-logs.module';
+import { SupervisorSuggestionsModule } from './modules/supervisor-suggestions/supervisor-suggestions.module';
 import { UploadsModule } from './modules/uploads/uploads.module';
 import { StorageModule } from './shared/storage/storage.service';
+import { CacheModule } from './shared/cache.service';
 import { FormattedSqlLogger } from './common/sql-logger';
 import { JwtAuthMiddleware } from './common/jwt-auth.middleware';
 import { TokenRefreshInterceptor } from './common/token-refresh.interceptor';
@@ -60,7 +64,7 @@ import { TokenRefreshInterceptor } from './common/token-refresh.interceptor';
         username: config.get('MYSQL_USER', 'root'),
         password: config.get('MYSQL_PASSWORD', ''),
         database: config.get('MYSQL_DATABASE', 'lan_dual_role_system'),
-        entities: [User, Employee, Account, Post, Lead, LeadFollowRecord, LeadDraft, CollaborationTask, Order, OrderFollowRecord, ImportTask, Notification, Favorite, PostMetricsHistory, ExportTask, OperationLog],
+        entities: [User, Employee, Account, Post, Lead, LeadFollowRecord, LeadDraft, CollaborationTask, Order, OrderFollowRecord, OrderAbnormalFeedback, ImportTask, Notification, Favorite, PostMetricsHistory, ExportTask, OperationLog],
         synchronize: false,
         charset: 'utf8mb4',
         logging: true,
@@ -82,6 +86,7 @@ import { TokenRefreshInterceptor } from './common/token-refresh.interceptor';
       }),
     }),
     PassportModule.register({ defaultStrategy: 'jwt' }),
+    ScheduleModule.forRoot(),
     AuthModule,
     EmployeesModule,
     UsersModule,
@@ -101,8 +106,10 @@ import { TokenRefreshInterceptor } from './common/token-refresh.interceptor';
     AnalyticsModule,
     ExportsModule,
     OperationLogsModule,
+    SupervisorSuggestionsModule,
     UploadsModule,
     StorageModule,
+    CacheModule,
   ],
   providers: [
     {

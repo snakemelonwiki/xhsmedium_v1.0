@@ -2,6 +2,7 @@ import {
   BarChartOutlined,
   BookOutlined,
   DatabaseOutlined,
+  ExportOutlined,
   FormOutlined,
   FundOutlined,
   ImportOutlined,
@@ -13,6 +14,7 @@ import {
   UsergroupAddOutlined,
 } from '@ant-design/icons';
 import type { MenuProps } from 'antd';
+import Link from 'next/link';
 import type { ReactNode } from 'react';
 
 import type { AppRole } from '@/shared/auth/auth';
@@ -28,16 +30,23 @@ export type AppMenuItem = {
 export const APP_MENU_ITEMS: AppMenuItem[] = [
   {
     key: 'operation-home',
-    label: '运营首页',
+    label: '总览',
     path: '/operation',
     icon: <BarChartOutlined />,
     roles: ['operation'],
   },
   {
-    key: 'operation-leads',
-    label: '客资看板',
-    path: '/operation/leads',
-    icon: <DatabaseOutlined />,
+    key: 'operation-rankings',
+    label: '运营排行榜/学习榜单',
+    path: '/operation/rankings',
+    icon: <FundOutlined />,
+    roles: ['operation'],
+  },
+  {
+    key: 'operation-dashboard',
+    label: '个人看板',
+    path: '/operation/dashboard',
+    icon: <BarChartOutlined />,
     roles: ['operation'],
   },
   {
@@ -55,8 +64,15 @@ export const APP_MENU_ITEMS: AppMenuItem[] = [
     roles: ['operation'],
   },
   {
+    key: 'operation-leads',
+    label: '客资看板',
+    path: '/operation/leads',
+    icon: <DatabaseOutlined />,
+    roles: ['operation'],
+  },
+  {
     key: 'operation-posts',
-    label: '作品列表',
+    label: '我的作品',
     path: '/operation/posts',
     icon: <OrderedListOutlined />,
     roles: ['operation'],
@@ -69,45 +85,24 @@ export const APP_MENU_ITEMS: AppMenuItem[] = [
     roles: ['operation'],
   },
   {
-    key: 'operation-rankings',
-    label: '排行榜',
-    path: '/operation/rankings',
-    icon: <FundOutlined />,
-    roles: ['operation'],
-  },
-  {
-    key: 'operation-dashboard',
-    label: '个人看板',
-    path: '/operation/dashboard',
-    icon: <BarChartOutlined />,
-    roles: ['operation'],
-  },
-  {
-    key: 'operation-collaboration',
-    label: '协同处理',
-    path: '/operation/collaboration',
-    icon: <ProjectOutlined />,
-    roles: ['operation'],
-  },
-  {
-    key: 'operation-source-pending',
-    label: '待确认来源',
-    path: '/operation/leads/source-pending',
-    icon: <ProjectOutlined />,
-    roles: ['operation'],
-  },
-  {
-    key: 'operation-imports',
-    label: '导入记录',
-    path: '/operation/imports',
-    icon: <ImportOutlined />,
+    key: 'operation-accounts',
+    label: '账号管理',
+    path: '/operation/accounts',
+    icon: <ShopOutlined />,
     roles: ['operation'],
   },
   {
     key: 'operation-messages',
-    label: '消息',
+    label: '消息中心',
     path: '/operation/messages',
     icon: <MessageOutlined />,
+    roles: ['operation'],
+  },
+  {
+    key: 'operation-exports',
+    label: '导出中心',
+    path: '/operation/exports',
+    icon: <ImportOutlined />,
     roles: ['operation'],
   },
   {
@@ -174,6 +169,20 @@ export const APP_MENU_ITEMS: AppMenuItem[] = [
     roles: ['academic'],
   },
   {
+    key: 'academic-reminders',
+    label: '节点提醒',
+    path: '/academic/reminders',
+    icon: <ProjectOutlined />,
+    roles: ['academic'],
+  },
+  {
+    key: 'academic-exports',
+    label: '导出中心',
+    path: '/academic/exports',
+    icon: <ExportOutlined />,
+    roles: ['academic'],
+  },
+  {
     key: 'academic-messages',
     label: '消息',
     path: '/academic/messages',
@@ -181,53 +190,81 @@ export const APP_MENU_ITEMS: AppMenuItem[] = [
     roles: ['academic'],
   },
   {
+    key: 'owner-home',
+    label: '总后台首页',
+    path: '/owner',
+    icon: <TeamOutlined />,
+    roles: ['owner'],
+  },
+  {
     key: 'admin-home',
-    label: '主管首页',
+    label: '总览',
     path: '/admin',
     icon: <TeamOutlined />,
-    roles: ['admin'],
+    roles: ['admin', 'owner'],
+  },
+  {
+    key: 'admin-rankings',
+    label: '运营排行榜',
+    path: '/admin/rankings',
+    icon: <FundOutlined />,
+    roles: ['admin', 'owner'],
+  },
+  {
+    key: 'admin-personal',
+    label: '个人看板',
+    path: '/admin/personal',
+    icon: <BarChartOutlined />,
+    roles: ['admin', 'owner'],
+  },
+  {
+    key: 'admin-posts',
+    label: '作品看板',
+    path: '/admin/posts',
+    icon: <OrderedListOutlined />,
+    roles: ['admin', 'owner'],
   },
   {
     key: 'admin-leads',
     label: '客资看板',
     path: '/admin/leads',
     icon: <DatabaseOutlined />,
-    roles: ['admin'],
+    roles: ['admin', 'owner'],
   },
   {
     key: 'admin-employees',
     label: '员工管理',
     path: '/admin/employees',
     icon: <TeamOutlined />,
-    roles: ['admin'],
-  },
-  {
-    key: 'admin-orders',
-    label: '订单看板',
-    path: '/admin/orders',
-    icon: <OrderedListOutlined />,
-    roles: ['admin'],
+    roles: ['admin', 'owner'],
   },
   {
     key: 'admin-accounts',
     label: '账号管理',
     path: '/admin/accounts',
     icon: <ShopOutlined />,
-    roles: ['admin'],
+    roles: ['admin', 'owner'],
   },
   {
     key: 'admin-analytics',
-    label: '基础分析',
+    label: '分析看板',
     path: '/admin/analytics',
     icon: <FundOutlined />,
-    roles: ['admin'],
+    roles: ['admin', 'owner'],
   },
   {
     key: 'admin-messages',
-    label: '消息',
+    label: '消息中心',
     path: '/admin/messages',
     icon: <MessageOutlined />,
-    roles: ['admin'],
+    roles: ['admin', 'owner'],
+  },
+  {
+    key: 'admin-imports',
+    label: '导出中心',
+    path: '/admin/exports',
+    icon: <ImportOutlined />,
+    roles: ['admin', 'owner'],
   },
 ];
 
@@ -241,10 +278,17 @@ export function getMenuItemsByRole(role: AppRole): AppMenuItem[] {
 /**
  * 转成 Ant Design Menu 需要的数据结构。
  */
-export function toAntdMenuItems(items: AppMenuItem[]): MenuProps['items'] {
+export function toAntdMenuItems(
+  items: AppMenuItem[],
+  onNavigateIntent?: (path: string) => void,
+): MenuProps['items'] {
   return items.map((item) => ({
     key: item.path,
     icon: item.icon,
-    label: item.label,
+    label: (
+      <Link href={item.path} onMouseEnter={() => onNavigateIntent?.(item.path)}>
+        {item.label}
+      </Link>
+    ),
   }));
 }

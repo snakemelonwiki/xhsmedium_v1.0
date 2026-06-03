@@ -24,6 +24,15 @@ export class OrderFollowRecord {
   @Column({ name: 'next_remind_at', type: 'datetime', nullable: true })
   nextRemindAt: Date | null;
 
+  @Column({ name: 'reminder_sent_at', type: 'datetime', nullable: true })
+  reminderSentAt: Date | null;
+
+  @Column({ name: 'attachment_url', type: 'varchar', length: 512, nullable: true })
+  attachmentUrl: string | null;
+
+  @Column({ name: 'attachment_name', type: 'varchar', length: 255, nullable: true })
+  attachmentName: string | null;
+
   @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;
 }

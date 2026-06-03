@@ -13,6 +13,7 @@ import {
 } from '@/shared/api/notifications';
 import { StatusTag } from '@/shared/components/status';
 import type { NotificationItem } from '@/shared/types/notifications';
+import { formatDateTime } from '@/shared/utils/date-format';
 
 type NotificationListPageProps = {
   title: string;
@@ -57,6 +58,17 @@ export function NotificationListPage({ title, description }: NotificationListPag
         await markNotificationRead(item.id);
       } catch (err) {
         message.warning(err instanceof Error ? err.message : '标记已读失败');
+      }
+    }
+    // 订单异常消息：显式跳销售端订单详情（即便 backend 没回 routeHint 也能兜底）
+    if (
+      item.notificationType === 'order_abnormal' ||
+      item.targetType === 'order_abnormal'
+    ) {
+      const target = item.targetId;
+      if (target != null) {
+        router.push(`/sales/orders/${target}`);
+        return;
       }
     }
     if (item.routeHint) {
@@ -134,7 +146,7 @@ export function NotificationListPage({ title, description }: NotificationListPag
                   description={(
                     <Space direction="vertical" size={4}>
                       {item.content ? <Typography.Text type="secondary">{item.content}</Typography.Text> : null}
-                      <Typography.Text type="secondary">{item.createdAt || '-'}</Typography.Text>
+                      <Typography.Text type="secondary">{formatDateTime(item.createdAt)}</Typography.Text>
                     </Space>
                   )}
                 />

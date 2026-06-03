@@ -15,6 +15,7 @@ interface PostListFilters {
   from?: string;
   to?: string;
   sort?: string;
+  search?: string;
 }
 
 interface PlazaFilters {
@@ -38,7 +39,7 @@ export class PostsService {
 
   async findAll(): Promise<any[]> {
     const rows = await this.postRepository.find({ order: { publishedAt: 'DESC', createdAt: 'DESC' } });
-    return rows.map(this.mapPost);
+    return this.attachJoinNames(rows.map(this.mapPost));
   }
 
   async findByEmployee(employeeId: string): Promise<any[]> {
@@ -46,7 +47,7 @@ export class PostsService {
       where: { employeeId },
       order: { publishedAt: 'DESC', createdAt: 'DESC' },
     });
-    return rows.map(this.mapPost);
+    return this.attachJoinNames(rows.map(this.mapPost));
   }
 
   async findAllPaged(limit: number, offset: number): Promise<{ items: any[]; total: number; limit: number; offset: number }> {
@@ -64,6 +65,10 @@ export class PostsService {
     if (filters.postType) qb.andWhere('p.post_type = :postType', { postType: filters.postType });
     if (filters.from) qb.andWhere('p.published_at >= :from', { from: filters.from });
     if (filters.to) qb.andWhere('p.published_at <= :to', { to: filters.to });
+    if (filters.search) {
+      const kw = `%${filters.search}%`;
+      qb.andWhere('(p.title LIKE :kw OR p.copywriting LIKE :kw)', { kw });
+    }
 
     if (filters.sort === 'leads') {
       qb.addSelect((subQb) => {
@@ -80,7 +85,8 @@ export class PostsService {
     }
 
     const [rows, total] = await qb.take(safeLimit).skip(safeOffset).getManyAndCount();
-    return { items: rows.map(this.mapPost), total, limit: safeLimit, offset: safeOffset };
+    const items = await this.attachJoinNames(rows.map(this.mapPost));
+    return { items, total, limit: safeLimit, offset: safeOffset };
   }
 
   async findAllPagedLegacy(limit: number, offset: number): Promise<{ items: any[]; total: number; limit: number; offset: number }> {
@@ -91,14 +97,51 @@ export class PostsService {
       take: safeLimit,
       skip: safeOffset,
     });
-    return { items: rows.map(this.mapPost), total, limit: safeLimit, offset: safeOffset };
+    const items = await this.attachJoinNames(rows.map(this.mapPost));
+    return { items, total, limit: safeLimit, offset: safeOffset };
+  }
+
+  /**
+   * 根据作品链接识别平台并返回录入表单可直接回填的字段。
+   */
+  parsePostLink(postUrl: string): { platform: string; postUrl: string; title: string } {
+    const normalizedUrl = normalizeExternalUrl(postUrl);
+    const lowerUrl = normalizedUrl.toLowerCase();
+    let platform = '其他';
+    if (lowerUrl.includes('xiaohongshu.com') || lowerUrl.includes('xhslink.com')) {
+      platform = '小红书';
+    } else if (lowerUrl.includes('douyin.com') || lowerUrl.includes('iesdouyin.com')) {
+      platform = '抖音';
+    }
+    return {
+      platform,
+      postUrl: normalizedUrl,
+      title: `${platform}作品`,
+    };
+  }
+
+  /**
+   * 查找重复作品链接，更新时可排除当前作品。
+   */
+  async findDuplicateByUrl(postUrl: string, excludeId?: string): Promise<any | null> {
+    const normalizedUrl = normalizeExternalUrl(postUrl);
+    if (!normalizedUrl) return null;
+    const qb = this.postRepository.createQueryBuilder('p')
+      .where('p.post_url = :postUrl', { postUrl: normalizedUrl });
+    if (excludeId) qb.andWhere('p.id != :excludeId', { excludeId });
+    const row = await qb.getOne();
+    return row ? this.mapPost(row) : null;
   }
 
   async findByEmployeePaged(employeeId: string, limit: number, offset: number): Promise<{ items: any[]; total: number; limit: number; offset: number }> {
     return this.findPaged({ employeeId }, limit, offset);
   }
 
-  async findPlaza(filters: PlazaFilters): Promise<any[]> {
+  async findPlaza(
+    filters: PlazaFilters,
+    page: number = 1,
+    pageSize: number = 20,
+  ): Promise<{ items: any[]; total: number }> {
     const params: any[] = [filters.userId || ''];
     const whereParts = ['1=1'];
 
@@ -126,7 +169,34 @@ export class PostsService {
       params.push(filters.userId || '');
     }
 
-    const havingClause = filters.view === 'excellent' ? 'HAVING leads_count >= 5' : '';
+    const havingClause = filters.view === 'excellent' ? 'HAVING lc.cnt >= 5' : '';
+
+    // Count query for total
+    // 优化：使用预聚合子表替代相关子查询，消除 N+1 问题
+    const countSql = `
+      SELECT COUNT(DISTINCT p.id) AS total
+      FROM posts p
+      LEFT JOIN employees e ON e.id = p.employee_id
+      LEFT JOIN accounts a ON a.id = p.account_id
+      LEFT JOIN (
+        SELECT post_id, COUNT(*) AS cnt
+        FROM leads
+        WHERE post_id IS NOT NULL
+        GROUP BY post_id
+      ) lc ON lc.post_id = p.id
+      ${favoriteJoin}
+      WHERE ${whereParts.join(' AND ')}
+      ${havingClause}
+    `;
+    const countParams = [...params];
+    const countResult = await this.postRepository.query(countSql, countParams);
+    const total = Number((countResult[0] as any)?.total || 0);
+
+    // Data query with pagination
+    const safePageSize = Math.min(Math.max(Number(pageSize) || 20, 1), 200);
+    const safePage = Math.max(Number(page) || 1, 1);
+    const offset = (safePage - 1) * safePageSize;
+
     const sql = `
       SELECT
         p.id, p.employee_id, p.account_id, p.platform, p.title, p.copywriting,
@@ -136,28 +206,41 @@ export class PostsService {
         p.created_at, p.updated_at,
         e.name AS employee_name,
         a.account_name,
-        (SELECT COUNT(*) FROM leads l WHERE l.post_id = p.id) AS leads_count,
-        (SELECT COUNT(*) FROM favorites fav_total
-          WHERE fav_total.target_type = 'post'
-            AND fav_total.target_id = p.id COLLATE utf8mb4_unicode_ci
-        ) AS favorite_count,
-        EXISTS(
-          SELECT 1 FROM favorites fav
-          WHERE fav.target_type = 'post'
-            AND fav.target_id = p.id COLLATE utf8mb4_unicode_ci
-            AND fav.user_id = ?
-        ) AS is_favorited
+        COALESCE(lc.cnt, 0) AS leads_count,
+        COALESCE(fc.cnt, 0) AS favorite_count,
+        CASE WHEN fav_user.target_id IS NOT NULL THEN 1 ELSE 0 END AS is_favorited
       FROM posts p
       LEFT JOIN employees e ON e.id = p.employee_id
       LEFT JOIN accounts a ON a.id = p.account_id
+      LEFT JOIN (
+        SELECT post_id, COUNT(*) AS cnt
+        FROM leads
+        WHERE post_id IS NOT NULL
+        GROUP BY post_id
+      ) lc ON lc.post_id = p.id
+      LEFT JOIN (
+        SELECT target_id, COUNT(*) AS cnt
+        FROM favorites
+        WHERE target_type = 'post'
+        GROUP BY target_id
+      ) fc ON fc.target_id = p.id
+      LEFT JOIN (
+        SELECT target_id
+        FROM favorites
+        WHERE target_type = 'post' AND user_id = ?
+      ) fav_user ON fav_user.target_id = p.id
       ${favoriteJoin}
       WHERE ${whereParts.join(' AND ')}
       ${havingClause}
-      ORDER BY leads_count DESC, p.likes DESC, p.published_at DESC, p.created_at DESC
+      ORDER BY COALESCE(lc.cnt, 0) DESC, p.likes DESC, p.published_at DESC, p.created_at DESC
+      LIMIT ? OFFSET ?
     `;
 
-    const rows = await this.postRepository.query(sql, params);
-    return (rows as any[]).map((row) => this.mapPostRow(row));
+    // dataParams: params 已经包含 userId（首元素）和过滤条件；末尾追加 pageSize 和 offset
+    // 注意：不要再追加 filters.userId，否则会重复（之前导致 LIMIT 收到 userId 字符串而非数字）
+    const dataParams = [...params, safePageSize, offset];
+    const rows = await this.postRepository.query(sql, dataParams);
+    return { items: (rows as any[]).map((row) => this.mapPostRow(row)), total };
   }
 
   private clampLimit(limit: number): number {
@@ -229,11 +312,12 @@ export class PostsService {
     await this.postRepository.update(id, { supervisorSuggestion: suggestion || '' });
   }
 
-  async updateMetrics(id: string, metrics: { likes: number; comments: number; favorites: number; metricsUpdatedAt: Date | null }): Promise<void> {
+  async updateMetrics(id: string, metrics: { likes: number; comments: number; favorites: number; shares?: number; metricsUpdatedAt: Date | null }): Promise<void> {
     await this.postRepository.update(id, {
       likes: metrics.likes,
       comments: metrics.comments,
       favorites: metrics.favorites,
+      shares: Number(metrics.shares || 0),
       metricsUpdatedAt: metrics.metricsUpdatedAt,
     });
   }
@@ -248,6 +332,27 @@ export class PostsService {
       favorites: Number(metrics.favorites || 0),
       shares: Number(metrics.shares || 0),
       leadsCount,
+    }));
+  }
+
+  /**
+   * 查询作品指标历史，按最新记录优先展示。
+   */
+  async getMetricsHistory(postId: string): Promise<any[]> {
+    const rows = await this.metricsHistoryRepository.find({
+      where: { postId },
+      order: { createdAt: 'DESC' },
+      take: 200,
+    });
+    return rows.map((row) => ({
+      id: row.id,
+      postId: row.postId,
+      likes: Number(row.likes || 0),
+      comments: Number(row.comments || 0),
+      favorites: Number(row.favorites || 0),
+      shares: Number(row.shares || 0),
+      leadsCount: Number(row.leadsCount || 0),
+      createdAt: row.createdAt,
     }));
   }
 
@@ -309,5 +414,48 @@ export class PostsService {
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
     };
+  }
+
+  /**
+   * 把 employeeName / accountName 注入到 mapPost 输出上，
+   * employeeId / accountId 保持不变，前端"员工"列优先显示姓名。
+   * 单次批量查询，避免 N+1。
+   */
+  private async attachJoinNames(items: any[]): Promise<any[]> {
+    if (!items.length) return items;
+
+    const employeeIds = Array.from(new Set(items.map((i) => i.employeeId).filter(Boolean)));
+    const accountIds = Array.from(new Set(items.map((i) => i.accountId).filter(Boolean)));
+
+    const employeeNameMap = new Map<string, string>();
+    if (employeeIds.length) {
+      const placeholders = employeeIds.map(() => '?').join(',');
+      const rows: Array<{ id: string; name: string | null; employee_code: string | null }> = await this.postRepository.manager.query(
+        `SELECT id, name, employee_code FROM employees WHERE id IN (${placeholders})`,
+        employeeIds,
+      );
+      for (const r of rows) {
+        // 姓名缺失时回退到员工编号（备注用途），仍然缺失则交给前端兜底显示 ID
+        employeeNameMap.set(r.id, (r.name || r.employee_code || '').trim());
+      }
+    }
+
+    const accountNameMap = new Map<string, string>();
+    if (accountIds.length) {
+      const placeholders = accountIds.map(() => '?').join(',');
+      const rows: Array<{ id: string; account_name: string | null }> = await this.postRepository.manager.query(
+        `SELECT id, account_name FROM accounts WHERE id IN (${placeholders})`,
+        accountIds,
+      );
+      for (const r of rows) {
+        accountNameMap.set(r.id, (r.account_name || '').trim());
+      }
+    }
+
+    return items.map((i) => ({
+      ...i,
+      employeeName: employeeNameMap.get(i.employeeId) || '',
+      accountName: accountNameMap.get(i.accountId) || '',
+    }));
   }
 }

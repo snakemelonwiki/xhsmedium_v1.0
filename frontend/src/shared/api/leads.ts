@@ -43,6 +43,26 @@ export type CreateCollaborationTaskBody = {
   urgency?: 'normal' | 'urgent' | 'critical' | string;
   reason: string;
   remark?: string;
+  /** 期望处理时间（ISO 字符串或 yyyy-MM-ddTHH:mm）；后端暂未消费，预留给 1.2 排期使用 */
+  expectedHandleTime?: string | null;
+};
+
+export type CloseLeadDealPayload = {
+  amount?: number | string | null;
+  serviceType?: string | null;
+  contractStatus?: 'unsigned' | 'signed' | 'pending' | string;
+  paidStatus?: 'unpaid' | 'partial' | 'paid' | string;
+  deliveryRequirement?: string | null;
+  expectedHandleTime?: string | null;
+};
+
+export type SalesHomeSummary = {
+  newAssigned: number;
+  pendingAdd: number;
+  notPassed: number;
+  pendingCommunicate: number;
+  todayFollowups: number;
+  pendingOrders: number;
 };
 
 function text(value: unknown): string | undefined {
@@ -74,7 +94,12 @@ function mapLead(raw: RawRecord): SalesLead {
       id: text(raw.employeeId) ?? text(raw.operatorId),
       name: text(raw.employeeName) ?? text(raw.operatorName),
     },
+    sales: {
+      id: text(raw.assignedSalesUserId) ?? text(raw.assigned_sales_user_id) ?? text(raw.salesId),
+      name: text(raw.assignedSalesUserName) ?? text(raw.assigned_sales_user_name) ?? text(raw.salesName),
+    },
     assignedAt: text(raw.assignedAt) ?? text(raw.createdAt),
+    updatedAt: text(raw.updatedAt) ?? text(raw.updated_at) ?? text(raw.salesUpdatedAt),
     status: text(raw.status) ?? 'new',
     addStatus: text(raw.addStatus) ?? 'not_added',
     processStatus: text(raw.processStatus) ?? 'not_contacted',
@@ -86,6 +111,9 @@ function mapLead(raw: RawRecord): SalesLead {
     captureImageUrl: text(raw.captureImageUrl) ?? text(raw.capture_image_url),
     leadCode: text(raw.leadCode) ?? text(raw.lead_code),
     addMethod: text(raw.addMethod) ?? text(raw.add_method),
+    ip: text(raw.ip),
+    requirementNote: text(raw.requirementNote) ?? text(raw.requirement_note),
+    supervisorNote: text(raw.supervisorNote) ?? text(raw.supervisor_note),
   };
 }
 
@@ -123,6 +151,7 @@ function collaborationTitle(raw: RawRecord): string {
 function normalizeCollaborationStatus(status?: string): string | undefined {
   if (!status) return undefined;
   const aliases: Record<string, string> = {
+    requested: 'pending',
     in_progress: 'handling',
     processing: 'handling',
     pending_operation: 'pending',
@@ -252,4 +281,61 @@ export async function confirmLeadSource({ leadId, matchedPostId, sourceOperatorI
     matchedPostId,
     sourceOperatorId,
   });
+}
+
+/**
+ * 销售标记成交：调用后端 /api/leads/:id/close-deal，
+ * 后端会在事务内创建订单并把 lead 状态推进到 handed_over。
+ *
+ * 字段对应后端 closeDeal：serviceType / amount / remark 等。
+ * contractStatus / paidStatus / deliveryRequirement / expectedHandleTime
+ * 是 v1.2 前端表单扩展字段，会原样透传；后端目前只消费 serviceType/amount/remark。
+ */
+export async function closeLeadDeal(id: string, body: CloseLeadDealPayload) {
+  const payload = {
+    amount: body.amount ?? null,
+    serviceType: body.serviceType ?? null,
+    contractStatus: body.contractStatus ?? null,
+    paidStatus: body.paidStatus ?? null,
+    deliveryRequirement: body.deliveryRequirement ?? null,
+    expectedHandleTime: body.expectedHandleTime ?? null,
+    remark: body.deliveryRequirement ?? null,
+  };
+  return apiClient.post<{ ok?: boolean; orderId?: string }>(`/leads/${id}/close-deal`, payload);
+}
+
+const EMPTY_SALES_HOME_SUMMARY: SalesHomeSummary = {
+  newAssigned: 0,
+  pendingAdd: 0,
+  notPassed: 0,
+  pendingCommunicate: 0,
+  todayFollowups: 0,
+  pendingOrders: 0,
+};
+
+function numberOrZero(value: unknown): number {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * 销售端首页六宫格汇总。优先请求后端 /api/sales/home-summary；
+ * 后端没有时（v1.2 文档约定的临时方案）回退到本地 mock 静态数字，
+ * 后续真接口就绪后只需删除 try/catch 兜底即可。
+ */
+export async function getSalesHomeSummary(): Promise<SalesHomeSummary> {
+  const payload = await apiClient
+    .get<Partial<SalesHomeSummary> | null>('/sales/home-summary')
+    .catch(() => null);
+  if (!payload || typeof payload !== 'object') {
+    return EMPTY_SALES_HOME_SUMMARY;
+  }
+  return {
+    newAssigned: numberOrZero((payload as SalesHomeSummary).newAssigned),
+    pendingAdd: numberOrZero((payload as SalesHomeSummary).pendingAdd),
+    notPassed: numberOrZero((payload as SalesHomeSummary).notPassed),
+    pendingCommunicate: numberOrZero((payload as SalesHomeSummary).pendingCommunicate),
+    todayFollowups: numberOrZero((payload as SalesHomeSummary).todayFollowups),
+    pendingOrders: numberOrZero((payload as SalesHomeSummary).pendingOrders),
+  };
 }

@@ -2,6 +2,7 @@ import { Controller, Get, Query, Req, Res } from '@nestjs/common';
 import { RankingsService } from './rankings.service';
 import { Request, Response } from 'express';
 import { todayString, yesterdayString } from '../../shared/utils/date-utils';
+import { getSessionUserId } from '../../common/session.utils';
 
 @Controller('rankings')
 export class RankingsController {
@@ -15,6 +16,8 @@ export class RankingsController {
     @Query('date') date?: string,
     @Query('limit') limit?: string,
     @Query('offset') offset?: string,
+    @Query('platform') platform?: string,
+    @Query('period') period?: string,
   ) {
     const session = (req as any).session;
     const targetDate = date || todayString();
@@ -25,11 +28,34 @@ export class RankingsController {
         targetDate,
         Number(limit) || 20,
         Number(offset) || 0,
+        { platform, period },
       );
       return res.json(result);
     }
-    const rows = await this.rankingsService.getRankings(type || 'posts', targetDate);
+    const rows = await this.rankingsService.getRankings(type || 'posts', targetDate, { platform, period });
     return res.json(rows);
+  }
+
+  /**
+   * A端运营排行榜契约别名，统一承载作品数、客资数、流量和学习榜入口。
+   */
+  @Get('operations')
+  async getOperationRankings(
+    @Res() res: Response,
+    @Query('type') type?: string,
+    @Query('period') period?: string,
+    @Query('limit') limit?: string,
+    @Query('offset') offset?: string,
+    @Query('platform') platform?: string,
+  ) {
+    const result = await this.rankingsService.getRankingsPaged(
+      type || 'posts',
+      todayString(),
+      Number(limit) || 20,
+      Number(offset) || 0,
+      { platform, period },
+    );
+    return res.json(result);
   }
 
   /**
@@ -38,8 +64,7 @@ export class RankingsController {
    */
   @Get('learning-posts')
   async getLearningPosts(@Query('days') days: string | undefined, @Req() req: Request, @Res() res: Response) {
-    const session = (req as any).session;
-    const userId: string = session?.userId || '';
+    const userId: string = getSessionUserId(req);
     const parsed = Number(days);
     const safeDays = Number.isFinite(parsed) && parsed > 0 ? parsed : 7;
     const rows = await this.rankingsService.getLearningPosts(safeDays, userId);

@@ -126,14 +126,51 @@ export class NotificationsService {
 
   /**
    * Mark every unread notification of the user as read. Returns affected count.
+   * When typeCode is provided, the update is scoped to that notification type.
    */
-  async markAllRead(userId: string): Promise<number> {
+  async markAllRead(userId: string, typeCode?: string): Promise<number> {
     if (!userId) return 0;
+    const qb = this.repo
+      .createQueryBuilder()
+      .update(Notification)
+      .set({ readStatus: 1 });
+    if (typeCode) {
+      qb.where('receiver_id = :uid AND read_status = 0 AND type_code = :typeCode', {
+        uid: userId,
+        typeCode,
+      });
+    } else {
+      qb.where('receiver_id = :uid AND read_status = 0', { uid: userId });
+    }
+    const result = await qb.execute();
+    return result.affected || 0;
+  }
+
+  /**
+   * Mark a batch of notifications (by id) as read. Only notifications owned
+   * by the current user and currently unread are flipped to read. The
+   * id list is deduplicated and any empty entries are dropped. Returns the
+   * number of rows actually updated.
+   */
+  async markReadMany(userId: string, ids: string[]): Promise<number> {
+    if (!userId) return 0;
+    if (!Array.isArray(ids) || ids.length === 0) return 0;
+    const uniqueIds = Array.from(
+      new Set(
+        ids
+          .map((id) => (id == null ? '' : String(id).trim()))
+          .filter((id) => id.length > 0),
+      ),
+    );
+    if (uniqueIds.length === 0) return 0;
     const result = await this.repo
       .createQueryBuilder()
       .update(Notification)
       .set({ readStatus: 1 })
-      .where('receiver_id = :uid AND read_status = 0', { uid: userId })
+      .where('receiver_id = :uid AND read_status = 0 AND id IN (:...ids)', {
+        uid: userId,
+        ids: uniqueIds,
+      })
       .execute();
     return result.affected || 0;
   }
@@ -207,13 +244,28 @@ export class NotificationsService {
   private buildRouteHint(portType: string, targetType: string | null, targetId: string | null): string | null {
     if (!targetType || !targetId) return null;
     if (targetType === 'lead') {
-      return portType === 'operations' ? `/operation/leads/${targetId}` : `/sales/leads/${targetId}`;
+      return portType === 'operations' ? `/operation/leads?leadId=${targetId}` : `/sales/leads/${targetId}`;
     }
     if (targetType === 'collaboration_task') {
-      return portType === 'operations' ? '/operation/collaboration' : '/sales/collaboration';
+      return portType === 'operations'
+        ? `/operation/collaboration?taskId=${targetId}`
+        : `/sales/collaboration?taskId=${targetId}`;
     }
     if (targetType === 'order') {
       return portType === 'academic' ? `/academic/orders/${targetId}` : `/sales/orders/${targetId}`;
+    }
+    // N-P1-08 修复：导出/导入通知此前无 routeHint 分支，用户点击只 markRead 不跳转。
+    // 导出：当前实现只有 /academic/exports 页面可消费（前端不存在 /operation/exports
+    //       /sales/exports /admin/exports），因此无论 portType 都跳到 academic 页。
+    //       未来新增其它端口的导出页时，再按 portType 分支细化。
+    // 导入：admin 与 operation 两个页面均可消费，admin 优先。
+    if (targetType === 'export') {
+      return `/academic/exports?taskId=${targetId}`;
+    }
+    if (targetType === 'import_task' || targetType === 'import') {
+      return portType === 'admin'
+        ? `/admin/imports?taskId=${targetId}`
+        : `/operation/imports?taskId=${targetId}`;
     }
     return null;
   }

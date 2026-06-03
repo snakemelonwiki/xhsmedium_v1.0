@@ -19,6 +19,11 @@ export interface LeadOperatorSummary {
   name?: string;
 }
 
+export interface LeadSalesSummary {
+  id?: string | number;
+  name?: string;
+}
+
 export interface SalesLead {
   id: string | number;
   customerName: string;
@@ -28,7 +33,9 @@ export interface SalesLead {
   wechat?: string;
   source?: LeadSourceSummary;
   operator?: LeadOperatorSummary;
+  sales?: LeadSalesSummary;
   assignedAt?: string;
+  updatedAt?: string;
   status: LeadStatusCode | string;
   addStatus?: AddStatusCode | string;
   processStatus?: ProcessStatusCode | string;
@@ -40,6 +47,12 @@ export interface SalesLead {
   captureImageUrl?: string;
   leadCode?: string;
   addMethod?: string;
+  /** IP / 地区（运营端填写） */
+  ip?: string;
+  /** 需求备注（运营端填写） */
+  requirementNote?: string;
+  /** 主管备注（运营端填写） */
+  supervisorNote?: string;
 }
 
 export type LeadTimelineKind = 'follow' | 'collaboration';

@@ -2,6 +2,7 @@ import { Body, Controller, Get, Param, Post, Query, Req, Res, UploadedFile, UseI
 import { FileInterceptor } from '@nestjs/platform-express';
 import { Request, Response } from 'express';
 import { ImportsService } from './imports.service';
+import { getSessionUserId } from '../../common/session.utils';
 
 @Controller()
 export class ImportsController {
@@ -10,83 +11,86 @@ export class ImportsController {
   @Post('leads/import-paste')
   async importPaste(@Body() body: any, @Req() req: Request, @Res() res: Response) {
     const session = (req as any).session;
-    const actorUserId = session?.userId || session?.id || body?.actorUserId || 'anonymous';
+    const actorUserId = getSessionUserId(req) || body?.actorUserId || 'anonymous';
     const actorEmployeeId = session?.employeeId || body?.employeeId || '';
     const rows = Array.isArray(body?.rows) ? body.rows : [];
     if (rows.length === 0) {
       return res.status(400).json({ ok: false, message: 'rows required' });
     }
-    const result = await this.importsService.importLeadsPaste(rows, actorUserId, actorEmployeeId);
-    return res.json(result);
+    // 异步入口：创建任务 + 入队，返回 taskId
+    const { taskId, status } = await this.importsService.enqueueImport({
+      type: 'leads-paste',
+      userId: actorUserId,
+      employeeId: actorEmployeeId,
+      rows,
+    });
+    return res.json({ ok: true, taskId, status });
   }
 
   @Post('leads/import')
   @UseInterceptors(FileInterceptor('file'))
   async importExcel(@UploadedFile() file: any, @Body() body: any, @Req() req: Request, @Res() res: Response) {
     const session = (req as any).session;
-    const actorUserId = session?.userId || session?.id || body?.actorUserId || 'anonymous';
+    const actorUserId = getSessionUserId(req) || body?.actorUserId || 'anonymous';
     const actorEmployeeId = session?.employeeId || body?.employeeId || '';
     const rows = this.rowsFromUpload(file, body);
     if (rows.length === 0) {
       return res.status(400).json({ ok: false, message: 'file or rows required' });
     }
-    const result = await this.importsService.importLeadsPaste(rows, actorUserId, actorEmployeeId);
-    return res.json(result);
+    // 异步入口：创建任务 + 入队，返回 taskId
+    const { taskId, status } = await this.importsService.enqueueImport({
+      type: 'leads-import',
+      userId: actorUserId,
+      employeeId: actorEmployeeId,
+      rows,
+      fileBuffer: file?.buffer,
+    });
+    return res.json({ ok: true, taskId, status });
   }
 
-  @Get('leads/import-template.xlsx')
-  async downloadTemplate(@Res() res: Response) {
-    const BOM = '﻿';
-    const csv =
-      BOM +
-      '平台,联系方式,昵称,来源账号,备注\n' +
-      '小红书,13800138000,示例客户,运营A,客户备注示例\n';
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader(
-      'Content-Disposition',
-      'attachment; filename="leads_import_template.csv"',
-    );
-    return res.send(csv);
-  }
+  // leads/import-template.xlsx 已挪到 LeadsController（避免被 leads/:id 路由抢占）。
 
   @Post('posts/import-paste')
   async importPostsPaste(@Body() body: any, @Req() req: Request, @Res() res: Response) {
     const session = (req as any).session;
-    const actorUserId = session?.userId || session?.id || body?.actorUserId || 'anonymous';
+    const actorUserId = getSessionUserId(req) || body?.actorUserId || 'anonymous';
     const actorEmployeeId = session?.employeeId || body?.employeeId || '';
     const rows = Array.isArray(body?.rows) ? body.rows : [];
     if (rows.length === 0) {
       return res.status(400).json({ ok: false, message: 'rows required' });
     }
-    const result = await this.importsService.importPostsPaste(rows, actorUserId, actorEmployeeId);
-    return res.json(result);
+    // 异步入口：创建任务 + 入队，返回 taskId
+    const { taskId, status } = await this.importsService.enqueueImport({
+      type: 'posts-paste',
+      userId: actorUserId,
+      employeeId: actorEmployeeId,
+      rows,
+    });
+    return res.json({ ok: true, taskId, status });
   }
 
   @Post('posts/import')
   @UseInterceptors(FileInterceptor('file'))
   async importPostsExcel(@UploadedFile() file: any, @Body() body: any, @Req() req: Request, @Res() res: Response) {
     const session = (req as any).session;
-    const actorUserId = session?.userId || session?.id || body?.actorUserId || 'anonymous';
+    const actorUserId = getSessionUserId(req) || body?.actorUserId || 'anonymous';
     const actorEmployeeId = session?.employeeId || body?.employeeId || '';
     const rows = this.rowsFromUpload(file, body);
     if (rows.length === 0) {
       return res.status(400).json({ ok: false, message: 'file or rows required' });
     }
-    const result = await this.importsService.importPostsPaste(rows, actorUserId, actorEmployeeId);
-    return res.json(result);
+    // 异步入口：创建任务 + 入队，返回 taskId
+    const { taskId, status } = await this.importsService.enqueueImport({
+      type: 'posts-import',
+      userId: actorUserId,
+      employeeId: actorEmployeeId,
+      rows,
+      fileBuffer: file?.buffer,
+    });
+    return res.json({ ok: true, taskId, status });
   }
 
-  @Get('posts/import-template.xlsx')
-  async downloadPostsTemplate(@Res() res: Response) {
-    const BOM = '﻿';
-    const csv =
-      BOM +
-      '平台,标题,作品类型,作品链接,账号ID,发布时间,文案,封面URL,流量,点赞,评论,收藏,备注\n' +
-      '小红书,示例作品,获客贴,https://example.com,,2026-05-31,示例文案,,0,0,0,0,备注\n';
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', 'attachment; filename="posts_import_template.csv"');
-    return res.send(csv);
-  }
+  // posts/import-template.xlsx 已挪到 PostsController（避免被 posts/:id 路由抢占）。
 
   @Get('import-tasks/:id')
   async getTask(@Param('id') id: string, @Res() res: Response) {
@@ -106,7 +110,7 @@ export class ImportsController {
     @Query('offset') offset?: string,
   ) {
     const session = (req as any).session;
-    const actorUserId = session?.userId || session?.id || 'anonymous';
+    const actorUserId = getSessionUserId(req) || 'anonymous';
     // 任一存在 → 走 paged → 返回对象；否则数组（兼容旧前端）
     if (limit !== undefined || offset !== undefined) {
       const paged = await this.importsService.listTasksPaged(

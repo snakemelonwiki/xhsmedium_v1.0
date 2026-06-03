@@ -78,6 +78,17 @@ function buildRouteHint(opts: {
     if (normalizedPort === 'admin') return `/admin/orders?orderId=${targetId}`;
     return `/sales/orders/${targetId}`;
   }
+  if (normalizedType.includes('export')) {
+    const exportTaskId = relatedId ?? targetId;
+    if (normalizedPort === 'operation') return `/operation/exports?taskId=${exportTaskId}`;
+    if (normalizedPort === 'admin') return `/admin/exports?taskId=${exportTaskId}`;
+    return `/academic/exports?taskId=${exportTaskId}`;
+  }
+  if (normalizedType.includes('import')) {
+    return normalizedPort === 'admin'
+      ? `/admin/imports?taskId=${relatedId ?? targetId}`
+      : `/operation/imports?taskId=${relatedId ?? targetId}`;
+  }
   return undefined;
 }
 
