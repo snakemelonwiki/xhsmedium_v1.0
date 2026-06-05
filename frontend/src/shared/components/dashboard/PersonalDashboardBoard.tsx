@@ -45,6 +45,7 @@ import { useMemo, useState } from 'react';
 
 import { useEchartsChart, useEchartsRender } from './useEchartsChart';
 import { usePersonalDashboardData } from './usePersonalDashboardData';
+import { PlatformAnalysisPanel } from './PlatformAnalysisPanel';
 import styles from './PersonalDashboardBoard.module.css';
 
 // echarts 通过 layout.tsx 注入的 CDN script 暴露为 window.echarts，
@@ -404,6 +405,13 @@ export function PersonalDashboardBoard({ employeeId, showRefreshButton = true }:
           </Card>
         </Col>
       </Row>
+
+      {/* v1.3 双平台数据分析面板（顶部 3 概览卡 + 3 榜单 Top 8） */}
+      <PlatformAnalysisPanel
+        rankings={rankings}
+        platformDist={platformDist}
+        loading={loadingRankings}
+      />
 
       {/* 三大效率榜（OP-24 legacy 样式） */}
       <Card

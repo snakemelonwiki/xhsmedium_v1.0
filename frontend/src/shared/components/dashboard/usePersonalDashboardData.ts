@@ -18,16 +18,18 @@ import {
 import type { PlatformDistributionItem, PlatformTrend } from '@/shared/types/content';
 
 /**
- * 把 AuthExpiredError（401 登录失效）映射成友好文案，
- * 避免在 Alert 上直接抛「登录已失效，请重新登录」让用户误以为被踢下线。
- * 仪表板是只读视图，登录态丢失不应阻塞页面（用户可重试或返回上级菜单）。
+ * 把 AuthExpiredError（401 登录失效）映射成友好文案。
+ * 仪表板是只读视图，错误不应阻塞页面，用户可重试或刷新。
+ *
+ * 注意：空数据（200 返回空数组）不会进入此函数，各组件会显示"暂无数据"。
+ * 只有真正的错误（401/403/500/网络错误）才会调用此函数。
  */
 export function normalizeDashboardError(err: unknown): string {
   if (err instanceof AuthExpiredError) {
-    return '当前会话已过期，请点击刷新按钮或重新登录后重试';
+    return '登录已失效，请刷新页面或重新登录';
   }
   if (err instanceof Error) return err.message;
-  return '个人看板加载失败';
+  return '数据加载失败，请稍后重试';
 }
 
 /** 按 OP-1 时间切换器返回日期范围（前端只用来作为 OP-18/19 图表的 from/to 上界）。 */
@@ -134,19 +136,22 @@ export function usePersonalDashboardData(params: UsePersonalDashboardParams): Us
     setLoadingDualPlatform(true);
     try {
       const [dist, trend] = await Promise.all([
-        getPersonalPlatformDistribution({ from: dualRange.from, to: dualRange.to, platform }),
-        getPersonalPlatformTrend({ period: trendPeriod, from: dualRange.from, to: dualRange.to }),
+        getPersonalPlatformDistribution({ from: dualRange.from, to: dualRange.to, platform, employeeId }),
+        getPersonalPlatformTrend({ period: trendPeriod, from: dualRange.from, to: dualRange.to, employeeId }),
       ]);
       setPlatformDist(dist);
       setPlatformTrend(trend);
+      // 空数据不算错误，各组件自己处理空状态（饼图/柱状图有 isEmpty + emptyHTML）
     } catch (err) {
       setPlatformDist([]);
       setPlatformTrend(undefined);
+      // 只有真正的错误（401/403/500/网络错误）才设置error
+      // 空数据（200返回空数组）不设置error
       setError((prev) => prev ?? normalizeDashboardError(err));
     } finally {
       setLoadingDualPlatform(false);
     }
-  }, [dualRange.from, dualRange.to, platform, trendPeriod]);
+  }, [dualRange.from, dualRange.to, platform, trendPeriod, employeeId]);
 
   useEffect(() => {
     void loadOverview();

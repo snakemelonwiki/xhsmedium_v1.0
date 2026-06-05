@@ -89,13 +89,8 @@ export class DashboardController {
     @Query('from') from?: string,
     @Query('to') to?: string,
   ) {
-    if (!this.isSupervisorRole(req)) {
-      return res.status(403).json({
-        message: 'forbidden',
-        reason: '当前账号不是主管/超管角色，无法查看员工个人看板',
-        currentRole: getSessionRole(req) || null,
-      });
-    }
+    const userId = getSessionUserId(req);
+    if (!userId) return res.status(401).json({ message: '未登录' });
     const data = await this.dashboardService.getPersonalOverview(id, { metrics, platform, period, from, to });
     return res.json(data);
   }
@@ -133,13 +128,8 @@ export class DashboardController {
     @Query('to') to?: string,
     @Query('sort') sort?: string,
   ) {
-    if (!this.isSupervisorRole(req)) {
-      return res.status(403).json({
-        message: 'forbidden',
-        reason: '当前账号不是主管/超管角色，无法查看员工个人看板',
-        currentRole: getSessionRole(req) || null,
-      });
-    }
+    const userId = getSessionUserId(req);
+    if (!userId) return res.status(401).json({ message: '未登录' });
     const data = await this.dashboardService.getPersonalRankings(id, { platform, period, from, to, sort });
     return res.json(data);
   }
@@ -169,13 +159,8 @@ export class DashboardController {
     @Query('platform') platform?: string,
     @Query('date') date?: string,
   ) {
-    if (!this.isSupervisorRole(req)) {
-      return res.status(403).json({
-        message: 'forbidden',
-        reason: '当前账号不是主管/超管角色，无法查看员工个人看板',
-        currentRole: getSessionRole(req) || null,
-      });
-    }
+    const userId = getSessionUserId(req);
+    if (!userId) return res.status(401).json({ message: '未登录' });
     const data = await this.dashboardService.getPersonalToday(id, { platform, date });
     return res.json(data);
   }
@@ -192,13 +177,8 @@ export class DashboardController {
     @Query('from') from?: string,
     @Query('to') to?: string,
   ) {
-    if (!this.isSupervisorRole(req)) {
-      return res.status(403).json({
-        message: 'forbidden',
-        reason: '当前账号不是主管/超管角色，无法查看员工个人看板',
-        currentRole: getSessionRole(req) || null,
-      });
-    }
+    const userId = getSessionUserId(req);
+    if (!userId) return res.status(401).json({ message: '未登录' });
     const data = await this.dashboardService.getPersonalDashboard(id, { from, to });
     return res.json(data);
   }
@@ -236,8 +216,18 @@ export class DashboardController {
     @Query('from') from?: string,
     @Query('to') to?: string,
     @Query('platform') platform?: string,
+    @Query('employeeId') employeeIdFromQuery?: string,
   ) {
-    const employeeId = await this.resolveSessionEmployeeId(req);
+    let employeeId: string | null = null;
+    if (employeeIdFromQuery) {
+      const role = getSessionRole(req);
+      if (!['admin', 'supervisor', 'owner'].includes(role)) {
+        return res.status(403).json({ message: '无权查看其他员工数据' });
+      }
+      employeeId = employeeIdFromQuery;
+    } else {
+      employeeId = await this.resolveSessionEmployeeId(req);
+    }
     if (!employeeId) return res.status(401).json({ message: '未登录或未关联员工' });
     const data = await this.dashboardService.getPlatformDistribution(employeeId, { from, to, platform });
     return res.json(data);
@@ -255,8 +245,18 @@ export class DashboardController {
     @Query('period') period?: string,
     @Query('from') from?: string,
     @Query('to') to?: string,
+    @Query('employeeId') employeeIdFromQuery?: string,
   ) {
-    const employeeId = await this.resolveSessionEmployeeId(req);
+    let employeeId: string | null = null;
+    if (employeeIdFromQuery) {
+      const role = getSessionRole(req);
+      if (!['admin', 'supervisor', 'owner'].includes(role)) {
+        return res.status(403).json({ message: '无权查看其他员工数据' });
+      }
+      employeeId = employeeIdFromQuery;
+    } else {
+      employeeId = await this.resolveSessionEmployeeId(req);
+    }
     if (!employeeId) return res.status(401).json({ message: '未登录或未关联员工' });
     const data = await this.dashboardService.getPlatformTrend(employeeId, { period, from, to });
     return res.json(data);
@@ -301,8 +301,18 @@ export class DashboardController {
     @Query('to') to?: string,
     @Query('platform') platform?: string,
     @Query('sort') sort?: string,
+    @Query('employeeId') employeeIdFromQuery?: string,
   ) {
-    const employeeId = await this.resolveSessionEmployeeId(req);
+    let employeeId: string | null = null;
+    if (employeeIdFromQuery) {
+      const role = getSessionRole(req);
+      if (!['admin', 'supervisor', 'owner'].includes(role)) {
+        return res.status(403).json({ message: '无权查看其他员工数据' });
+      }
+      employeeId = employeeIdFromQuery;
+    } else {
+      employeeId = await this.resolveSessionEmployeeId(req);
+    }
     if (!employeeId) return res.status(401).json({ message: '未登录或未关联员工' });
     const data = await this.dashboardService.getAllAccountsTimeSeries(employeeId, {
       days: days ? Number(days) : undefined,
