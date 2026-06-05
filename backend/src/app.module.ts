@@ -22,6 +22,15 @@ import { Favorite } from './entities/favorite.entity';
 import { PostMetricsHistory } from './entities/post-metrics-history.entity';
 import { ExportTask } from './entities/export-task.entity';
 import { OperationLog } from './entities/operation-log.entity';
+import { SupervisorSuggestion } from './entities/supervisor-suggestion.entity';
+import { ScrapingAlert } from './modules/scraping/scraping-alert.entity';
+// v1.3 增量（教务端表 M25）
+import { Teacher } from './entities/teacher.entity';
+import { OrderAuthor } from './entities/order-author.entity';
+import { OrderSubmission } from './entities/order-submission.entity';
+import { OrderStatusHistory } from './entities/order-status-history.entity';
+import { OrderReminder } from './entities/order-reminder.entity';
+import { OrderFinance } from './entities/order-finance.entity';
 import { AuthModule } from './modules/auth/auth.module';
 import { EmployeesModule } from './modules/employees/employees.module';
 import { UsersModule } from './modules/users/users.module';
@@ -30,19 +39,24 @@ import { PostsModule } from './modules/posts/posts.module';
 import { LeadsModule } from './modules/leads/leads.module';
 import { LeadDraftsModule } from './modules/lead-drafts/lead-drafts.module';
 import { LeadsParserModule } from './modules/leads-parser/leads-parser.module';
+import { ParserModule } from './modules/parser/parser.module';
 import { ImportsModule } from './modules/imports/imports.module';
 import { CollaborationTasksModule } from './modules/collaboration-tasks/collaboration-tasks.module';
 import { OrdersModule } from './modules/orders/orders.module';
 import { DashboardModule } from './modules/dashboard/dashboard.module';
 import { RankingsModule } from './modules/rankings/rankings.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
+import { RemindersModule } from './modules/reminders/reminders.module';
 import { FavoritesModule } from './modules/favorites/favorites.module';
 import { ToolsModule } from './modules/tools/tools.module';
 import { AnalyticsModule } from './modules/analytics/analytics.module';
 import { ExportsModule } from './modules/exports/exports.module';
 import { OperationLogsModule } from './modules/operation-logs/operation-logs.module';
 import { SupervisorSuggestionsModule } from './modules/supervisor-suggestions/supervisor-suggestions.module';
+import { ScrapingModule } from './modules/scraping/scraping.module';
 import { UploadsModule } from './modules/uploads/uploads.module';
+import { SalesModule } from './modules/sales/sales.module';
+import { EnumsModule } from './modules/enums/enums.module';
 import { StorageModule } from './shared/storage/storage.service';
 import { CacheModule } from './shared/cache.service';
 import { FormattedSqlLogger } from './common/sql-logger';
@@ -64,7 +78,7 @@ import { TokenRefreshInterceptor } from './common/token-refresh.interceptor';
         username: config.get('MYSQL_USER', 'root'),
         password: config.get('MYSQL_PASSWORD', ''),
         database: config.get('MYSQL_DATABASE', 'lan_dual_role_system'),
-        entities: [User, Employee, Account, Post, Lead, LeadFollowRecord, LeadDraft, CollaborationTask, Order, OrderFollowRecord, OrderAbnormalFeedback, ImportTask, Notification, Favorite, PostMetricsHistory, ExportTask, OperationLog],
+        entities: [User, Employee, Account, Post, Lead, LeadFollowRecord, LeadDraft, CollaborationTask, Order, OrderFollowRecord, OrderAbnormalFeedback, ImportTask, Notification, Favorite, PostMetricsHistory, ExportTask, OperationLog, SupervisorSuggestion, ScrapingAlert],
         synchronize: false,
         charset: 'utf8mb4',
         logging: true,
@@ -74,6 +88,7 @@ import { TokenRefreshInterceptor } from './common/token-refresh.interceptor';
           waitForConnections: true,
           queueLimit: 0,
           connectTimeout: 10000,
+          charset: 'utf8mb4_unicode_ci',
         },
       }),
     }),
@@ -95,19 +110,24 @@ import { TokenRefreshInterceptor } from './common/token-refresh.interceptor';
     LeadsModule,
     LeadDraftsModule,
     LeadsParserModule,
+    ParserModule,
     ImportsModule,
     CollaborationTasksModule,
     OrdersModule,
     DashboardModule,
     RankingsModule,
     NotificationsModule,
+    RemindersModule,
     FavoritesModule,
     ToolsModule,
     AnalyticsModule,
     ExportsModule,
     OperationLogsModule,
     SupervisorSuggestionsModule,
+    ScrapingModule,
     UploadsModule,
+    SalesModule,
+    EnumsModule,
     StorageModule,
     CacheModule,
   ],

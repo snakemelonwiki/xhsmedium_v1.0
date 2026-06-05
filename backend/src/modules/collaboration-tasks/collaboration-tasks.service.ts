@@ -115,9 +115,30 @@ export class CollaborationTasksService {
     });
 
     // §11.1 collab_requested: 通知客资来源运营。
+    // fallback：lead.employeeId 缺失 / 对应 user 找不到时，把通知广播给所有 role=operation
+    // 的运营账号，避免「协同任务已落库但运营/教务端没收到消息」的静默丢失。
+    let receiverIds: string[] = [];
     if (sourceUserId) {
+      receiverIds.push(sourceUserId);
+    } else {
+      const operators = await this.userRepository.find({
+        where: { role: 'operation' },
+        select: { id: true },
+      });
+      if (operators.length > 0) {
+        receiverIds = operators.map((u) => u.id);
+        this.logger.warn(
+          `[collab] lead ${dto.leadId} 缺失 employeeId 映射，通知已 fallback 给 ${operators.length} 个运营账号`,
+        );
+      } else {
+        this.logger.warn(
+          `[collab] lead ${dto.leadId} 无 sourceUserId 且系统内无 role=operation 账号，协同通知已跳过`,
+        );
+      }
+    }
+    if (receiverIds.length > 0) {
       await this.notificationsService.create({
-        receiverIds: [sourceUserId],
+        receiverIds,
         senderId: dto.requesterId,
         portType: 'operations',
         typeCode: NOTIFICATION_TYPES.COLLAB_REQUESTED,
@@ -302,6 +323,30 @@ export class CollaborationTasksService {
     }
     const task = await this.repo.findOne({ where: { id } });
     if (!task) return null;
+    // TC-HANDLE-IDEMPOTENT：已 handled 任务的重复 handle 走幂等短路，
+    // 避免前端重复点击（按钮没来得及 disable）触发 422 影响体验。
+    // - 同 handler / admin / owner / supervisor 全部返回 200 幂等成功；
+    // - 其它角色：再走 assertCanHandle，让"非处理人重复 handle"被 403 拦住，
+    //   防止任意用户拿到 handledNote/handlerId/handledAt 这些审计字段造成信息泄漏。
+    if (task.status === 'handled') {
+      const isPrivileged =
+        handlerActor.actorRole === 'admin' ||
+        handlerActor.actorRole === 'owner' ||
+        handlerActor.actorRole === 'supervisor' ||
+        task.handlerId === handlerActor.actorUserId;
+      if (isPrivileged) {
+        return {
+          ...(task as CollaborationTask),
+          // 在原 task 上挂两个标记字段，controller 端透传给前端。
+          // 不用 DTO 改字段，保持 typeorm entity shape 不变。
+          alreadyHandled: true as any,
+          handledBy: (task as any).handlerId,
+          handledAtField: (task as any).handledAt,
+        } as CollaborationTask;
+      }
+      // 非处理人重复 handle：交给 assertCanHandle 抛 'no permission'，
+      // controller 翻译为 403。
+    }
     if (task.status !== 'handling' && task.status !== 'pending') {
       throw new Error(`cannot handle task in status ${task.status}`);
     }

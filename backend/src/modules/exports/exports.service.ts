@@ -13,8 +13,6 @@ import { Account } from '../../entities/account.entity';
 import { Employee } from '../../entities/employee.entity';
 import { makeId } from '../../shared/utils/id-generator';
 import { StorageService } from '../../shared/storage/storage.service';
-import { NotificationsService } from '../notifications/notifications.service';
-import { NOTIFICATION_TYPES } from '../../shared/notifications';
 import { OperationLogsService } from '../operation-logs/operation-logs.service';
 
 export type ExportType =
@@ -65,19 +63,22 @@ const INTENTION_LEVEL_LABEL: Record<string, string> = {
 };
 
 const ORDER_STATUS_LABEL: Record<string, string> = {
-  to_receive: '待接单',
+  pending_accept: '待接单',
+  to_receive: '待领取',
   in_progress: '进行中',
   awaiting_client_info: '待客户资料',
   awaiting_teacher: '待安排老师',
   to_deliver: '待交付',
   completed: '已完成',
   abnormal: '异常',
+  closed: '已关闭',
 };
 
 const PAID_STATUS_LABEL: Record<string, string> = {
   unpaid: '未付款',
   partial: '部分付款',
-  paid: '已付款',
+  paid: '已付清',
+  refunded: '已退款',
 };
 
 const COLLAB_TYPE_LABEL: Record<string, string> = {
@@ -142,7 +143,6 @@ export class ExportsService implements OnModuleInit, OnModuleDestroy {
     @InjectRepository(User)
     private readonly userRepo: Repository<User>,
     private readonly storage: StorageService,
-    private readonly notifications: NotificationsService,
     private readonly operationLogs: OperationLogsService,
   ) {}
 
@@ -394,27 +394,7 @@ export class ExportsService implements OnModuleInit, OnModuleDestroy {
       finishedAt: new Date(),
     });
 
-    // §11.1 export_done: 通知发起人下载
-    if (task.userId) {
-      // 根据用户角色设置正确的端口类型
-      let portType: 'operations' | 'sales' | 'academic' = 'operations';
-      if (userRole === 'sales') {
-        portType = 'sales';
-      } else if (userRole === 'academic') {
-        portType = 'academic';
-      }
-
-      await this.notifications.create({
-        receiverIds: [task.userId],
-        senderId: null,
-        portType,
-        typeCode: NOTIFICATION_TYPES.EXPORT_DONE,
-        title: `${this.typeNameZh(task.exportType)}导出完成`,
-        content: `点击下载：${fileUrl}`,
-        relatedId: exportId,
-        relatedType: 'export',
-      });
-    }
+    // 导出完成，文件可直接下载，无需发送通知
 
     // 写 export_create 操作日志（脱敏 filter 字段）
     try {
@@ -943,6 +923,23 @@ export class ExportsService implements OnModuleInit, OnModuleDestroy {
     qb.orderBy('a.created_at', 'DESC');
     const rows = await qb.getMany();
 
+    // 收集 employeeId，批量解析为员工姓名（运营负责人列展示姓名，employeeId 仍可由前端筛选）
+    const employeeIds = Array.from(
+      new Set(rows.map((r) => String(r.employeeId || '').trim()).filter((id) => id.length > 0)),
+    );
+    const nameMap = new Map<string, string>();
+    if (employeeIds.length > 0) {
+      const placeholders = employeeIds.map(() => '?').join(',');
+      const empRows: Array<{ id: string; name: string | null; employee_code: string | null }> =
+        await this.employeeRepo.query(
+          `SELECT id, name, employee_code FROM employees WHERE id IN (${placeholders})`,
+          employeeIds,
+        );
+      for (const emp of empRows) {
+        nameMap.set(emp.id, (emp.name || emp.employee_code || '').trim());
+      }
+    }
+
     const headers = [
       '创建时间',
       '账号ID',
@@ -956,19 +953,23 @@ export class ExportsService implements OnModuleInit, OnModuleDestroy {
       '发布计划',
       '状态',
     ];
-    const data = rows.map((r) => [
-      r.createdAt,
-      r.id || '',
-      r.employeeId || '',
-      r.platform || '',
-      r.accountName || '',
-      r.accountUid || '',
-      r.profileUrl || '',
-      r.persona || '',
-      r.positioning || '',
-      r.postingPlan || '',
-      r.status || '',
-    ]);
+    const data = rows.map((r) => {
+      const eid = String(r.employeeId || '').trim();
+      const employeeName = eid ? (nameMap.get(eid) || eid) : '';
+      return [
+        r.createdAt,
+        r.id || '',
+        employeeName,
+        r.platform || '',
+        r.accountName || '',
+        r.accountUid || '',
+        r.profileUrl || '',
+        r.persona || '',
+        r.positioning || '',
+        r.postingPlan || '',
+        r.status || '',
+      ];
+    });
     return this.toCsv(headers, data);
   }
 
@@ -1032,9 +1033,11 @@ export class ExportsService implements OnModuleInit, OnModuleDestroy {
     if (!task) {
       return { ok: false, status: 404, message: 'not found' };
     }
-    const isAdminLike = role === 'admin' || role === 'owner';
+    // v1.3 BF-SUPERVISOR-EXPORT：supervisor 权限等同 admin/owner，可下载任意导出任务。
+    // 非 admin/owner/supervisor 看不到别人的任务，统一 404 避免泄露任务存在性。
+    const isAdminLike =
+      role === 'admin' || role === 'owner' || role === 'supervisor';
     if (!isAdminLike && task.userId && task.userId !== userId) {
-      // 非 admin/owner 看不到别人的任务，统一 404 避免泄露任务存在性
       return { ok: false, status: 404, message: 'not found' };
     }
     if (task.status !== 'completed') {

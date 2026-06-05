@@ -8,10 +8,10 @@ import { useRouter } from 'next/navigation';
 import { useEffect, useMemo, useState } from 'react';
 
 import { listOrders, updateOrder } from '@/shared/api/orders';
-import { createExport, type ExportFilter } from '@/shared/api/exports';
+import { createExport, downloadExportUrl, getExport, type ExportFilter } from '@/shared/api/exports';
 import { readStoredUser } from '@/shared/auth/auth';
 import type { OrderItem, OrderScope, OrderStatusCode } from '@/shared/types/orders';
-import { HANDOVER_STATUS_OPTIONS, HandoverStatusCode, handoverStatusMeta } from '@/shared/api/enums';
+import { HANDOVER_STATUS_OPTIONS, HandoverStatusCode, handoverStatusMeta, orderStatusMeta, paidStatusMeta } from '@/shared/api/enums';
 import { formatDateTime } from '@/shared/utils/date-format';
 
 const orderStatusOptions: { label: string; value: OrderStatusCode }[] = [
@@ -24,21 +24,8 @@ const orderStatusOptions: { label: string; value: OrderStatusCode }[] = [
   { label: '异常', value: 'abnormal' },
 ];
 
-const orderStatusMeta: Record<string, { label: string; color: string }> = {
-  to_receive: { label: '待领取', color: 'orange' },
-  in_progress: { label: '进行中', color: 'blue' },
-  awaiting_client_info: { label: '待客户资料', color: 'gold' },
-  awaiting_teacher: { label: '待老师', color: 'purple' },
-  to_deliver: { label: '待交付', color: 'cyan' },
-  completed: { label: '已完成', color: 'green' },
-  abnormal: { label: '异常', color: 'red' },
-};
-
-const paidStatusMeta: Record<string, { label: string; color: string }> = {
-  unpaid: { label: '未付款', color: 'default' },
-  partial: { label: '部分付款', color: 'gold' },
-  paid: { label: '已付款', color: 'green' },
-};
+// 旧版 paidStatusMeta / orderStatusMeta 内联字典已删除，统一消费 shared/api/enums。
+// 选中后 v1.3 P0 修复才能在「销售端订单详情」和「教务端订单详情」一致显示中文。
 
 interface OrderTableProps {
   title: string;
@@ -53,13 +40,14 @@ interface OrderTableProps {
   renderRowExtra?: (record: OrderItem) => React.ReactNode;
 }
 
+// 列表渲染使用集中 helper（v1.3 P0 修复后），避免和 enums.ts 重复维护。
 function renderOrderStatus(status: string) {
-  const meta = orderStatusMeta[status] ?? { label: status || '未知', color: 'default' };
+  const meta = orderStatusMeta(status);
   return <Tag color={meta.color}>{meta.label}</Tag>;
 }
 
 function renderPaidStatus(status: string) {
-  const meta = paidStatusMeta[status] ?? { label: status || '未知', color: 'default' };
+  const meta = paidStatusMeta(status);
   return <Tag color={meta.color}>{meta.label}</Tag>;
 }
 
@@ -173,6 +161,7 @@ export function OrderTable({ title, description, scope, status, showStatusFilter
 
   async function submitExportOrders() {
     setExportSubmitting(true);
+    const hide = message.loading('正在生成导出文件...', 0);
     try {
       const filter: ExportFilter = {
         scope: actionMode === 'academic' || actionMode === 'abnormal' ? 'academic' : (scope || 'all'),
@@ -184,13 +173,34 @@ export function OrderTable({ title, description, scope, status, showStatusFilter
         filter.to = exportRange[1].endOf('day').toISOString();
       }
       const result = await createExport({ exportType: 'orders', filter });
-      message.success(`导出任务已创建（#${result.id.slice(0, 8)}），完成后会通知`);
-      setExportModalOpen(false);
-      setExportRange(null);
-      setExportStatus('');
-      setExportPaidStatus('');
+
+      // 轮询导出状态，最多等待30秒
+      let attempts = 0;
+      const maxAttempts = 30;
+      while (attempts < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        const exportTask = await getExport(result.id);
+        if (exportTask.status === 'completed') {
+          hide();
+          window.open(downloadExportUrl(result.id), '_blank');
+          message.success('导出成功，文件开始下载');
+          setExportModalOpen(false);
+          setExportRange(null);
+          setExportStatus('');
+          setExportPaidStatus('');
+          return;
+        } else if (exportTask.status === 'failed') {
+          hide();
+          message.error('导出失败，请重试');
+          return;
+        }
+        attempts++;
+      }
+      hide();
+      message.warning('导出超时，请到导出中心查看');
       router.push('/academic/exports');
     } catch (err) {
+      hide();
       message.error(err instanceof Error ? err.message : '导出任务创建失败');
     } finally {
       setExportSubmitting(false);
@@ -427,7 +437,7 @@ export function OrderTable({ title, description, scope, status, showStatusFilter
       >
         <Space direction="vertical" size={12} style={{ width: '100%' }}>
           <Typography.Text type="secondary">
-            任务创建后会在导出中心异步生成 CSV，完成后会通过消息通知。
+            任务创建后会在后台异步生成 CSV，生成完成后会自动下载文件。
           </Typography.Text>
           <div>
             <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 4 }}>

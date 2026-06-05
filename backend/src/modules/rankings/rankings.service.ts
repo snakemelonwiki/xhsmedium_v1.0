@@ -18,11 +18,16 @@ export class RankingsService {
   ) {}
 
   /**
-   * 排行榜入口。
-   * - type: posts / leads（保留原语义）
+   * 排行榜入口，支持 4 类榜单和 7 种周期。
+   * - type: posts / leads / traffic / study
+   * - period: today / week / month / total / 7d / 14d / 30d
    * - date: 兼容旧前端单日参数
-   * - options.period: 'today' | '7d' | '30d'（None / today → 单日；7d/30d → 近 N 天区间）
    * - options.platform: xhs / douyin / 小红书 / 抖音（filter posts & leads）
+   *
+   * 作品数榜：排除删除、重复、无效作品
+   * 客资榜：排除重复、无联系方式且不可跟进客资
+   * 流量榜：按点赞数排序
+   * 学习榜：按客资数优先，客资相同再看获客效率和点赞数
    */
   async getRankings(
     type: string,
@@ -45,6 +50,7 @@ export class RankingsService {
       (l) => !platformFilter || l.platform === platformFilter,
     );
 
+    // 作品数榜：排除删除、重复、无效作品（通过 postsService.findAll 已过滤）
     if (type === 'posts') {
       const postCountByEmployee: Record<string, { total: number; xhs: number; douyin: number }> = {};
       for (const post of posts) {
@@ -55,23 +61,79 @@ export class RankingsService {
         if (post.platform === '小红书') postCountByEmployee[post.employeeId].xhs++;
         if (post.platform === '抖音') postCountByEmployee[post.employeeId].douyin++;
       }
-      return rows.map((r) => ({
-        ...r,
-        postCount: postCountByEmployee[r.employeeId]?.total || 0,
-        xhsPostCount: postCountByEmployee[r.employeeId]?.xhs || 0,
-        douyinPostCount: postCountByEmployee[r.employeeId]?.douyin || 0,
-      }));
+      return rows
+        .map((r) => ({
+          ...r,
+          postCount: postCountByEmployee[r.employeeId]?.total || 0,
+          xhsPostCount: postCountByEmployee[r.employeeId]?.xhs || 0,
+          douyinPostCount: postCountByEmployee[r.employeeId]?.douyin || 0,
+        }))
+        .sort((a, b) => b.postCount - a.postCount);
     }
 
+    // 客资榜：排除重复、无联系方式且不可跟进客资
     if (type === 'leads') {
       const leadCountByEmployee: Record<string, number> = {};
       for (const lead of leads) {
+        // 排除无效客资（无联系方式且不可跟进）
+        if (!lead.contactInfo && lead.status === 'invalid') continue;
         leadCountByEmployee[lead.employeeId] = (leadCountByEmployee[lead.employeeId] || 0) + 1;
       }
-      return rows.map((r) => ({
-        ...r,
-        leadCount: leadCountByEmployee[r.employeeId] || 0,
-      }));
+      return rows
+        .map((r) => ({
+          ...r,
+          leadCount: leadCountByEmployee[r.employeeId] || 0,
+        }))
+        .sort((a, b) => b.leadCount - a.leadCount);
+    }
+
+    // 流量榜：按 SUM(likes+comments+favorites) 排序
+    // v1.3 OP-7：运营统一口径——流量 = 点赞 + 评论 + 收藏（不含 shares），与 OP-16 一致。
+    if (type === 'traffic') {
+      const trafficByEmployee: Record<string, number> = {};
+      for (const post of posts) {
+        const score = Number(post.likes || 0) + Number(post.comments || 0) + Number(post.favorites || 0);
+        trafficByEmployee[post.employeeId] = (trafficByEmployee[post.employeeId] || 0) + score;
+      }
+      return rows
+        .map((r) => ({
+          ...r,
+          traffic: trafficByEmployee[r.employeeId] || 0,
+          likes: trafficByEmployee[r.employeeId] || 0, // 兼容老前端：traffic / likes 都用同一数值
+        }))
+        .sort((a, b) => b.traffic - a.traffic);
+    }
+
+    // 学习榜：按客资数优先，客资相同再看获客效率和点赞数
+    if (type === 'study') {
+      const studyByEmployee: Record<string, { leads: number; posts: number; likes: number }> = {};
+      for (const post of posts) {
+        if (!studyByEmployee[post.employeeId]) {
+          studyByEmployee[post.employeeId] = { leads: 0, posts: 0, likes: 0 };
+        }
+        studyByEmployee[post.employeeId].posts++;
+        studyByEmployee[post.employeeId].likes += Number(post.likes || 0);
+      }
+      for (const lead of leads) {
+        if (studyByEmployee[lead.employeeId]) {
+          studyByEmployee[lead.employeeId].leads++;
+        }
+      }
+      return rows
+        .map((r) => ({
+          ...r,
+          leads: studyByEmployee[r.employeeId]?.leads || 0,
+          posts: studyByEmployee[r.employeeId]?.posts || 0,
+          likes: studyByEmployee[r.employeeId]?.likes || 0,
+          efficiency: studyByEmployee[r.employeeId]
+            ? Number((studyByEmployee[r.employeeId].leads / studyByEmployee[r.employeeId].posts).toFixed(2))
+            : 0,
+        }))
+        .sort((a, b) => {
+          if (b.leads !== a.leads) return b.leads - a.leads;
+          if (b.efficiency !== a.efficiency) return b.efficiency - a.efficiency;
+          return b.likes - a.likes;
+        });
     }
 
     return rows;
@@ -92,19 +154,57 @@ export class RankingsService {
     return { items, total, limit, offset };
   }
 
+  /**
+   * 解析周期参数。
+   * 支持: today / week / month / total / 7d / 14d / 30d
+   */
   private resolveDateRange(date: string, period?: string): { from?: string; to?: string } {
     const p = String(period || '').trim().toLowerCase();
-    if (!p || p === 'today') return {};
-    const days = p === '7d' || p === '7' ? 7 : p === '30d' || p === '30' ? 30 : 0;
-    if (!days) return {};
     const to = new Date(date);
-    if (isNaN(to.getTime())) return {};
-    const from = new Date(to);
-    from.setDate(from.getDate() - (days - 1));
-    return {
-      from: from.toISOString().slice(0, 10),
-      to: to.toISOString().slice(0, 10),
-    };
+    if (isNaN(to.getTime())) {
+      return {};
+    }
+    const today = to.toISOString().slice(0, 10);
+
+    if (!p || p === 'today') return {};
+
+    // 近 N 天
+    if (p === '7d' || p === '7') {
+      const from = new Date(to);
+      from.setDate(from.getDate() - 6);
+      return { from: from.toISOString().slice(0, 10), to: today };
+    }
+    if (p === '14d' || p === '14') {
+      const from = new Date(to);
+      from.setDate(from.getDate() - 13);
+      return { from: from.toISOString().slice(0, 10), to: today };
+    }
+    if (p === '30d' || p === '30') {
+      const from = new Date(to);
+      from.setDate(from.getDate() - 29);
+      return { from: from.toISOString().slice(0, 10), to: today };
+    }
+
+    // 本周
+    if (['week', 'thisweek', '本周'].includes(p)) {
+      const from = new Date(to);
+      const day = from.getDay() || 7;
+      from.setDate(from.getDate() - day + 1);
+      return { from: from.toISOString().slice(0, 10), to: today };
+    }
+
+    // 本月
+    if (['month', 'thismonth', '本月'].includes(p)) {
+      const from = new Date(to.getFullYear(), to.getMonth(), 1);
+      return { from: from.toISOString().slice(0, 10), to: today };
+    }
+
+    // 累计
+    if (['all', 'total', '累计'].includes(p)) {
+      return { from: '1970-01-01', to: today };
+    }
+
+    return {};
   }
 
   private normalizePlatform(p?: string): string | null {

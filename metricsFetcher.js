@@ -1,5 +1,19 @@
 const fs = require("fs");
 const path = require("path");
+
+// Playwright 浏览器二进制路径：优先用环境变量（兼容用户自定义位置），
+// 否则尝试默认位置。Windows 上 C 盘满时把默认指向 D 盘避免 ENOSPC。
+// 关键：这段必须在 require("playwright") 之前执行 —— Playwright 在 require 时
+// 会按当时的 PLAYWRIGHT_BROWSERS_PATH 锁定 executablePath，事后改 env 不再生效。
+if (!process.env.PLAYWRIGHT_BROWSERS_PATH) {
+  if (process.platform === "win32") {
+    const dDrive = "D:\\playwright-browsers";
+    if (fs.existsSync(dDrive)) {
+      process.env.PLAYWRIGHT_BROWSERS_PATH = dDrive;
+    }
+  }
+}
+
 const { chromium } = require("playwright");
 
 const DEFAULT_TIMEOUT = 15000;
@@ -10,8 +24,11 @@ fs.mkdirSync(PROFILE_ROOT, { recursive: true });
 
 function detectPlatform(url) {
   const value = String(url || "").toLowerCase();
+  // 小红书:长链 + 短链
   if (value.includes("xiaohongshu.com") || value.includes("xhslink.com")) return "小红书";
-  if (value.includes("douyin.com")) return "抖音";
+  // 抖音:长链(douyin.com / iesdouyin.com 老短链 / v.douyin.com 新短链)
+  // 短链在抓取时会被 302 到长链,这里只做平台识别,真实 URL 在 page.goto 时由浏览器解析
+  if (value.includes("douyin.com") || value.includes("iesdouyin.com") || value.includes("v.douyin.com")) return "抖音";
   return "";
 }
 
@@ -144,22 +161,34 @@ async function readXiaohongshuInitialState(page) {
     const root = window.__INITIAL_STATE__ || window.__initialState__ || null;
     if (!root || typeof root !== "object") return null;
 
-    const candidates = [];
+    // 展开候选：从各种可能的路径收集 note 级数据
+    const rawCandidates = [];
 
     if (root.note?.noteDetailMap && typeof root.note.noteDetailMap === "object") {
-      candidates.push(...Object.values(root.note.noteDetailMap));
+      rawCandidates.push(...Object.values(root.note.noteDetailMap));
     }
-
     if (root.noteData?.data?.noteData) {
-      candidates.push(root.noteData.data.noteData);
+      rawCandidates.push(root.noteData.data.noteData);
     }
-
     if (root.data?.noteData?.data?.noteData) {
-      candidates.push(root.data.noteData.data.noteData);
+      rawCandidates.push(root.data.noteData.data.noteData);
+    }
+    if (root.noteData?.noteData) {
+      rawCandidates.push(root.noteData.noteData);
+    }
+    if (root.noteCard) {
+      rawCandidates.push(root.noteCard);
     }
 
-    if (root.noteData?.noteData) {
-      candidates.push(root.noteData.noteData);
+    // 将每个原始候选展开为扁平化的 note 数据对象（处理深度嵌套）
+    const notes = [];
+    for (const raw of rawCandidates) {
+      if (!raw || typeof raw !== "object") continue;
+      // noteDetailMap 的值可能形如 { note: { ... } } 或 { data: { note: { ... } } }
+      const target = raw.note || raw.data?.note || raw.noteData || raw;
+      if (target && typeof target === "object") {
+        notes.push(target);
+      }
     }
 
     const pickCount = (value) => {
@@ -169,16 +198,36 @@ async function readXiaohongshuInitialState(page) {
       return text || null;
     };
 
-    for (const item of candidates) {
-      if (!item || typeof item !== "object") continue;
-      const interact = item.interact_info || item.interactInfo || {};
-      const likes = pickCount(interact.liked_count ?? interact.likedCount ?? item.liked_count ?? item.likedCount);
-      const comments = pickCount(interact.comment_count ?? interact.commentCount ?? item.comment_count ?? item.commentCount ?? item.comments_count);
-      const favorites = pickCount(interact.collected_count ?? interact.collectedCount ?? interact.collect_count ?? interact.collectCount ?? item.collected_count ?? item.collectedCount);
-      const shares = pickCount(interact.share_count ?? interact.shareCount ?? interact.shared_count ?? interact.sharedCount ?? item.share_count ?? item.shareCount);
-      const title = String(item.title || item.display_title || item.note_title || "").trim();
-      if (likes !== null || comments !== null || favorites !== null || shares !== null) {
-        return { likes, comments, favorites, shares, title };
+    const extractUser = (obj) => {
+      if (!obj || typeof obj !== "object") return null;
+      const u = obj.user || obj.author || obj.authorInfo || {};
+      if (!u || typeof u !== "object") return null;
+      return {
+        authorName: String(u.nickname || u.name || u.userName || "").trim() || undefined,
+        authorId: String(u.userId || u.user_id || u.id || "").trim() || undefined,
+      };
+    };
+
+    for (const note of notes) {
+      if (!note || typeof note !== "object") continue;
+      const interact = note.interact_info || note.interactInfo || {};
+      const likes = pickCount(interact.liked_count ?? interact.likedCount ?? note.liked_count ?? note.likedCount);
+      const comments = pickCount(interact.comment_count ?? interact.commentCount ?? note.comment_count ?? note.commentCount ?? note.comments_count);
+      const favorites = pickCount(interact.collected_count ?? interact.collectedCount ?? interact.collect_count ?? interact.collectCount ?? note.collected_count ?? note.collectedCount);
+      const shares = pickCount(interact.share_count ?? interact.shareCount ?? interact.shared_count ?? interact.sharedCount ?? note.share_count ?? note.shareCount);
+      const title = String(note.title || note.display_title || note.note_title || note.desc || "").trim();
+      const author = extractUser(note);
+      if (likes !== null || comments !== null || favorites !== null || shares !== null || title) {
+        return { likes, comments, favorites, shares, title, ...(author || {}) };
+      }
+    }
+
+    // 兜底：只提取标题和作者（无互动数据时）
+    for (const note of notes) {
+      const title = String(note.title || note.display_title || note.note_title || note.desc || "").trim();
+      const author = extractUser(note);
+      if (title || author) {
+        return { likes: null, comments: null, favorites: null, shares: null, title, ...(author || {}) };
       }
     }
 
@@ -261,10 +310,24 @@ async function inferCountsFromBody(page) {
   };
 }
 
+async function readXiaohongshuMetaTags(page) {
+  return page.evaluate(() => {
+    const getMeta = (attr, value) => {
+      const el = document.querySelector(`meta[${attr}="${value}"]`);
+      return el?.getAttribute?.("content")?.trim() || "";
+    };
+    const title = getMeta("property", "og:title") || getMeta("name", "title") || "";
+    const description = getMeta("property", "og:description") || getMeta("name", "description") || "";
+    const authorName = getMeta("property", "og:author") || getMeta("name", "author") || "";
+    return { title, description, authorName };
+  }).catch(() => null);
+}
+
 async function scrapeXiaohongshu(page) {
   const initialState = await readXiaohongshuInitialState(page);
   const precise = await readXiaohongshuEngageBar(page);
   const htmlFallback = await inferXiaohongshuCountsFromHtml(page);
+  const metaTags = await readXiaohongshuMetaTags(page);
   const likes = parseCount(initialState?.likes) ?? parseCount(precise?.likes) ?? await readCountBySelectors(page, [
     ".interactions.engage-bar .interact-container .like-wrapper .count",
     ".engage-bar .interact-container .like-wrapper .count",
@@ -290,10 +353,18 @@ async function scrapeXiaohongshu(page) {
     "[data-testid*='share'] [class*='count']"
   ]);
 
+  // 标题：INITIAL_STATE > meta og:title > empty
+  const title = initialState?.title || metaTags?.title || metaTags?.description || "";
+  // 作者：INITIAL_STATE > meta og:author > empty
+  const authorName = initialState?.authorName || metaTags?.authorName || "";
+  const authorId = initialState?.authorId || "";
+
   const fallback = await inferCountsFromBody(page);
   return {
     bodyText: fallback.text,
-    title: initialState?.title || "",
+    title,
+    authorName,
+    authorId,
     likes: likes ?? htmlFallback.likes ?? fallback.likes ?? 0,
     comments: comments ?? htmlFallback.comments ?? fallback.comments ?? 0,
     favorites: favorites ?? htmlFallback.favorites ?? fallback.favorites ?? 0,
@@ -304,6 +375,7 @@ async function scrapeXiaohongshu(page) {
 async function scrapeDouyin(page) {
   const htmlFallback = await inferDouyinCountsFromHtml(page);
   const likes = await readCountBySelectors(page, [
+    "xpath=//*[@id=\"sliderVideo\"]/div[1]/div/div[1]/div[1]/div/div[2]/div[2]/div/div[2]",
     "[data-e2e='like-count']",
     "[class*='like'] [class*='count']",
     "span:has-text('赞') + span",
@@ -311,6 +383,7 @@ async function scrapeDouyin(page) {
     "[title*='点赞']"
   ]);
   const comments = await readCountBySelectors(page, [
+    "xpath=//*[@id=\"sliderVideo\"]/div[1]/div/div[1]/div[1]/div/div[2]/div[3]/div[1]/div[2]",
     "[data-e2e='comment-count']",
     "[class*='comment'] [class*='count']",
     "span:has-text('评论') + span",
@@ -318,6 +391,7 @@ async function scrapeDouyin(page) {
     "[title*='评论']"
   ]);
   const favorites = await readCountBySelectors(page, [
+    "xpath=//*[@id=\"sliderVideo\"]/div[1]/div/div[1]/div[1]/div/div[2]/div[4]/div[2]",
     "[data-e2e='collect-count']",
     "[data-e2e='favorite-count']",
     "[class*='collect'] [class*='count']",
@@ -326,6 +400,7 @@ async function scrapeDouyin(page) {
     "[title*='收藏']"
   ]);
   const shares = await readCountBySelectors(page, [
+    "xpath=//*[@id=\"sliderVideo\"]/div[1]/div/div[1]/div[1]/div/div[2]/div[6]/div[1]/div[2]",
     "[data-e2e='share-count']",
     "[class*='share'] [class*='count']",
     "span:has-text('分享') + span",
@@ -406,6 +481,75 @@ async function openLoginBrowser(platform) {
   return { ok: true, platform };
 }
 
+/**
+ * 关闭已打开的登录浏览器（释放 GUI 资源 + context）。
+ * 没有打开的 context 时返回 ok=false（不算错误）。
+ */
+async function closeLoginBrowser(platform) {
+  if (!platform || !["小红书", "抖音"].includes(platform)) {
+    throw new Error("请选择要登录的平台");
+  }
+  const context = loginContexts.get(platform);
+  if (!context) {
+    return { ok: false, platform, message: "该平台未打开登录浏览器" };
+  }
+  await context.close().catch(() => {});
+  // context.on("close") 已删除 loginContexts 里的引用
+  return { ok: true, platform };
+}
+
+/**
+ * 查询某平台 profile 是否带登录态（基于 Cookies 文件 + Local Storage 目录存在性）。
+ * 不读 Cookies 内容（避免解密 SQLite），只看文件存在 + 大小 > 0。
+ *
+ * 注：Chromium 124+ 把 Cookies 从 Default/Cookies 移到了 Default/Network/Cookies，
+ *     两路径都得查，否则新 profile 会误判为未登录。
+ */
+function getLoginStatus(platform) {
+  if (!platform || !["小红书", "抖音"].includes(platform)) {
+    throw new Error("请选择要登录的平台");
+  }
+  const profileDir = getProfileDir(platform);
+  const home = getPlatformHome(platform);
+  const exists = fs.existsSync(profileDir);
+  let hasSession = false;
+  let cookieSize = 0;
+  let cookiePath = null;
+  let localStorageExists = false;
+  let lastModified = null;
+  if (exists) {
+    // 新旧 Chromium profile 路径兼容
+    const candidateCookiePaths = [
+      path.join(profileDir, "Default", "Network", "Cookies"),  // Chromium 124+
+      path.join(profileDir, "Default", "Cookies"),              // Chromium < 124
+    ];
+    for (const p of candidateCookiePaths) {
+      try {
+        const stat = fs.statSync(p);
+        if (stat.size > 0) {
+          cookiePath = p;
+          cookieSize = stat.size;
+          lastModified = stat.mtime.toISOString();
+          hasSession = true;
+          break;
+        }
+      } catch {}
+    }
+    localStorageExists = fs.existsSync(path.join(profileDir, "Default", "Local Storage"));
+  }
+  return {
+    platform,
+    profileDir,
+    home,
+    isOpen: loginContexts.has(platform),
+    hasSession,
+    cookieSize,
+    cookiePath,
+    localStorageExists,
+    lastModified,
+  };
+}
+
 async function launchProfileContext(platform) {
   const profileDir = getProfileDir(platform);
   clearSingletonLocks(profileDir);
@@ -449,6 +593,8 @@ async function fetchMetricsFromUrl(url) {
     return {
       platform,
       title: normalizedTitle,
+      authorName: payload?.authorName || "",
+      authorId: payload?.authorId || "",
       likes: Number(payload.likes || 0),
       comments: Number(payload.comments || 0),
       favorites: Number(payload.favorites || 0),
@@ -463,5 +609,9 @@ async function fetchMetricsFromUrl(url) {
 module.exports = {
   detectPlatform,
   fetchMetricsFromUrl,
-  openLoginBrowser
+  openLoginBrowser,
+  closeLoginBrowser,
+  getLoginStatus,
+  getProfileDir,
+  getPlatformHome,
 };

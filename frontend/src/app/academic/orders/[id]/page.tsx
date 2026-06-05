@@ -7,10 +7,10 @@ import { useParams, useRouter } from 'next/navigation';
 import { useEffect, useState } from 'react';
 
 import { createAbnormalFeedback, closeAbnormalFeedback, createOrderFollowRecord, getOrderDetail, listAbnormalFeedbacks, listOrderFollowRecords } from '@/shared/api/orders';
-import { createExport } from '@/shared/api/exports';
+import { createExport, downloadExportUrl, getExport } from '@/shared/api/exports';
 import { uploadFile } from '@/shared/api/uploads';
 import { readStoredUser } from '@/shared/auth/auth';
-import { handoverStatusMeta } from '@/shared/api/enums';
+import { handoverStatusMeta, orderStatusMeta, paidStatusMeta } from '@/shared/api/enums';
 import type { AbnormalTypeCode, ExpectedHelperCode, OrderAbnormalFeedback, OrderFollowRecord, OrderItem } from '@/shared/types/orders';
 import { formatDateTime } from '@/shared/utils/date-format';
 
@@ -205,14 +205,36 @@ export default function AcademicOrderDetailPage() {
             loading={exporting}
             onClick={async () => {
               setExporting(true);
+              const hide = message.loading('正在生成导出文件...', 0);
               try {
                 const result = await createExport({
                   exportType: 'order_progress',
                   filter: { orderId, scope: 'academic' },
                 });
-                message.success(`订单跟进导出任务已创建（#${result.id.slice(0, 8)}），完成后会通知`);
+
+                // 轮询导出状态，最多等待30秒
+                let attempts = 0;
+                const maxAttempts = 30;
+                while (attempts < maxAttempts) {
+                  await new Promise((resolve) => setTimeout(resolve, 1000));
+                  const exportTask = await getExport(result.id);
+                  if (exportTask.status === 'completed') {
+                    hide();
+                    window.open(downloadExportUrl(result.id), '_blank');
+                    message.success('导出成功，文件开始下载');
+                    return;
+                  } else if (exportTask.status === 'failed') {
+                    hide();
+                    message.error('导出失败，请重试');
+                    return;
+                  }
+                  attempts++;
+                }
+                hide();
+                message.warning('导出超时，请到导出中心查看');
                 router.push('/academic/exports');
               } catch (err) {
+                hide();
                 message.error(err instanceof Error ? err.message : '导出任务创建失败');
               } finally {
                 setExporting(false);
@@ -236,8 +258,8 @@ export default function AcademicOrderDetailPage() {
                 { key: 'leadId', label: '客资 ID', children: emptyText(order?.leadId) },
                 { key: 'serviceType', label: '服务类型', children: emptyText(order?.serviceType) },
                 { key: 'amount', label: '金额', children: emptyText(order?.amount) },
-                { key: 'paidStatus', label: '付款状态', children: emptyText(order?.paidStatus) },
-                { key: 'orderStatus', label: '订单状态', children: emptyText(order?.orderStatus) },
+                { key: 'paidStatus', label: '付款状态', children: <Tag color={paidStatusMeta(order?.paidStatus).color}>{paidStatusMeta(order?.paidStatus).label}</Tag> },
+                { key: 'orderStatus', label: '订单状态', children: <Tag color={orderStatusMeta(order?.orderStatus).color}>{orderStatusMeta(order?.orderStatus).label}</Tag> },
                 {
                   key: 'handoverStatus',
                   label: '交接状态',

@@ -9,6 +9,7 @@ import {
   MessageOutlined,
   OrderedListOutlined,
   ProjectOutlined,
+  ScheduleOutlined,
   ShopOutlined,
   TeamOutlined,
   UsergroupAddOutlined,
@@ -29,6 +30,13 @@ export type AppMenuItem = {
 
 export const APP_MENU_ITEMS: AppMenuItem[] = [
   {
+    key: 'operation-today-tasks',
+    label: '今日任务',
+    path: '/operation/today-tasks',
+    icon: <BarChartOutlined />,
+    roles: ['operation'],
+  },
+  {
     key: 'operation-home',
     label: '总览',
     path: '/operation',
@@ -37,16 +45,30 @@ export const APP_MENU_ITEMS: AppMenuItem[] = [
   },
   {
     key: 'operation-rankings',
-    label: '运营排行榜/学习榜单',
+    label: '运营排行榜',
     path: '/operation/rankings',
     icon: <FundOutlined />,
     roles: ['operation'],
   },
   {
+    key: 'operation-rankings-study',
+    label: '学习榜单',
+    path: '/operation/rankings/study',
+    icon: <BookOutlined />,
+    roles: ['operation'],
+  },
+  {
     key: 'operation-dashboard',
     label: '个人看板',
-    path: '/operation/dashboard',
+    path: '/operation/dashboard/personal',
     icon: <BarChartOutlined />,
+    roles: ['operation'],
+  },
+  {
+    key: 'operation-dashboard-account-analysis',
+    label: '账号分析',
+    path: '/operation/dashboard/account-analysis',
+    icon: <FundOutlined />,
     roles: ['operation'],
   },
   {
@@ -88,7 +110,7 @@ export const APP_MENU_ITEMS: AppMenuItem[] = [
     key: 'operation-accounts',
     label: '账号管理',
     path: '/operation/accounts',
-    icon: <ShopOutlined />,
+    icon: <DatabaseOutlined />,
     roles: ['operation'],
   },
   {
@@ -99,10 +121,17 @@ export const APP_MENU_ITEMS: AppMenuItem[] = [
     roles: ['operation'],
   },
   {
+    key: 'operation-favorites',
+    label: '我的收藏',
+    path: '/operation/favorites',
+    icon: <BookOutlined />,
+    roles: ['operation'],
+  },
+  {
     key: 'operation-exports',
     label: '导出中心',
     path: '/operation/exports',
-    icon: <ImportOutlined />,
+    icon: <ExportOutlined />,
     roles: ['operation'],
   },
   {
@@ -113,10 +142,24 @@ export const APP_MENU_ITEMS: AppMenuItem[] = [
     roles: ['sales'],
   },
   {
-    key: 'sales-followups',
-    label: '待跟进',
-    path: '/sales/followups',
+    key: 'sales-orders',
+    label: '订单跟进',
+    path: '/sales/orders',
     icon: <BookOutlined />,
+    roles: ['sales'],
+  },
+  {
+    key: 'sales-today-followups',
+    label: '当日待跟进',
+    path: '/sales/today-followups',
+    icon: <ScheduleOutlined />,
+    roles: ['sales'],
+  },
+  {
+    key: 'sales-deals',
+    label: '我的成交',
+    path: '/sales/deals',
+    icon: <FundOutlined />,
     roles: ['sales'],
   },
   {
@@ -124,20 +167,6 @@ export const APP_MENU_ITEMS: AppMenuItem[] = [
     label: '协同',
     path: '/sales/collaboration',
     icon: <ProjectOutlined />,
-    roles: ['sales'],
-  },
-  {
-    key: 'sales-passive-leads',
-    label: '被动添加',
-    path: '/sales/passive-leads',
-    icon: <DatabaseOutlined />,
-    roles: ['sales'],
-  },
-  {
-    key: 'sales-orders',
-    label: '订单跟进',
-    path: '/sales/orders',
-    icon: <OrderedListOutlined />,
     roles: ['sales'],
   },
   {
@@ -199,7 +228,7 @@ export const APP_MENU_ITEMS: AppMenuItem[] = [
   {
     key: 'admin-home',
     label: '总览',
-    path: '/admin',
+    path: '/admin/dashboard',
     icon: <TeamOutlined />,
     roles: ['admin', 'owner'],
   },

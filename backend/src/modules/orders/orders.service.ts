@@ -1,8 +1,9 @@
 import { Injectable, NotFoundException, BadRequestException, ForbiddenException } from '@nestjs/common';
 import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
-import { Repository, DataSource, In } from 'typeorm';
+import { Repository, DataSource, EntityManager, In } from 'typeorm';
 import { Order, HANDOVER_STATUS_CODES, HandoverStatusCode } from '../../entities/order.entity';
 import { OrderFollowRecord } from '../../entities/order-follow-record.entity';
+import { OrderFinance } from '../../entities/order-finance.entity';
 import { Lead } from '../../entities/lead.entity';
 import { User } from '../../entities/user.entity';
 import { makeId } from '../../shared/utils/id-generator';
@@ -53,6 +54,15 @@ interface CloseDealDto {
   serviceType?: string | null;
   amount?: number | string | null;
   remark?: string | null;
+  // v1.3 / SA-8 销售成交录入扩展字段
+  productType?: string | null;
+  guaranteeType?: string | null;
+  paymentStage?: string | null;
+  clientRequirementNote?: string | null;
+  contractStatus?: string | null;
+  paidStatus?: string | null;
+  deliveryRequirement?: string | null;
+  expectedHandleTime?: string | Date | null;
 }
 
 interface ListOrdersOptions {
@@ -97,6 +107,8 @@ export class OrdersService {
     private readonly orderRepository: Repository<Order>,
     @InjectRepository(OrderFollowRecord)
     private readonly orderFollowRepository: Repository<OrderFollowRecord>,
+    @InjectRepository(OrderFinance)
+    private readonly orderFinanceRepository: Repository<OrderFinance>,
     @InjectRepository(User)
     private readonly userRepository: Repository<User>,
     @InjectDataSource()
@@ -114,54 +126,125 @@ export class OrdersService {
   /**
    * Sales marks a lead as deal-closed and spawns a new order in a single transaction.
    */
-  async closeDeal(leadId: string, salesUserId: string, dto: CloseDealDto): Promise<string> {
+  async closeDeal(
+    leadId: string,
+    salesUserId: string,
+    dto: CloseDealDto,
+  ): Promise<{ orderId: string; orderCode: string | null; orderFinanceId: string }> {
     if (!salesUserId) {
       throw new BadRequestException('sales user required');
     }
     const orderId = makeId();
+    const orderFinanceId = makeId();
     let leadContact = '';
+    let orderCode: string | null = null;
+    let generatedOrderCode: string | null = null;
     await this.dataSource.transaction(async (manager) => {
       const lead = await manager.findOne(Lead, { where: { id: leadId } });
       if (!lead) {
         throw new NotFoundException('lead not found');
       }
       leadContact = lead.contactInfo || '';
-      // S-P1-01 修复：closeDeal 旧实现写 `leads.status='deal_closed'`，但
-      //   - `leads.status` 的合法枚举（schema.sql §5）只有
-      //     new/assigned/in_followup/in_collaboration/operation_handled/added_success/invalid，
-      //     `deal_closed` 不在合法集合内，是"未定义值"（前端过滤不到、统计不到、SQL 兜底会丢失）。
-      //   - v1.2 文档 §10（客资状态机）期望把成交信号落在
-      //     `leads.process_status='deal_done'`，该值在 `leads.process_status` 合法枚举内
-      //     （not_contacted/waiting_pass/communicating/quoted/deal_pending/deal_done/invalid）。
-      //   - 同时让 `leads.status` 留在 `in_followup`（或保持原 status），保持状态机连续性；
-      //     不强行改 `leads.status='deal_done'`，因为该值不在 schema 的合法枚举里。
-      await manager.update(Lead, { id: leadId }, {
-        processStatus: 'deal_done',
-        dealStatus: 'deal_done',
-        status: 'in_followup',
-      });
-      await manager.insert(Order, {
-        id: orderId,
-        leadId,
-        salesUserId,
-        academicUserId: null,
-        serviceType: dto.serviceType ?? null,
-        amount: dto.amount != null && dto.amount !== '' ? String(dto.amount) : null,
-        paidStatus: 'unpaid',
-        orderStatus: 'to_receive',
-        handoverStatus: 'handed_over',
-        remark: dto.remark ?? null,
-      });
+      // v1.3 / CROSS-4: 在同一事务内生成订单编号 ORD-YYYYMMDD-XXXXX
+      // 必须在 INSERT Order 之前完成（行锁在同一事务内保持），避免并发时序号重复。
+      generatedOrderCode = await this.generateOrderCode(manager);
+      orderCode = generatedOrderCode;
+      // v1.3 / SA-8: 销售成交的 serviceType 字段可以同时承载"产品类型"语义,
+      // 但前端会把产品类型/服务类型分开传。后端保持 serviceType 字段为原"服务类型",
+      // 新加的"产品类型/保障类型/付款阶段"等放到 remark / order_finance 阶段备注中。
+      const mergedServiceType = dto.serviceType
+        || (dto.productType ? String(dto.productType) : null)
+        || null;
+      // BF-09b 修复 (2026-06-04) — 改用 raw SQL 替代 manager.insert() / manager.update():
+      //   TypeORM 1.0 在 InsertQueryBuilder/UpdateQueryBuilder 的 `addFrom` 路径里会
+      //   把 entity class 当作 entityTarget 传入 `entityOrProperty(this.subQuery())`。
+      //   entityTarget 是 ES6 class 时,无 new 调用抛 "Class constructor X cannot be
+      //   invoked without 'new'"。本补丁虽在 main.ts 加了 addFrom monkey-patch 绕开
+      //   hasMetadata 检查,但 entity class 与 metadata 注册顺序在 NestJS 异步初始化
+      //   下不稳定,仍可能漏判。raw SQL 100% 绕开 TypeORM 1.0 这条 bug 路径,且语义
+      //   与 insert/update 等价（带参数化,无 SQL 注入风险）。
+      const remark = this.composeRemark(dto);
+      const amountStr = dto.amount != null && dto.amount !== '' ? String(dto.amount) : null;
+      await manager.query(
+        `UPDATE leads
+         SET process_status = ?, deal_status = ?, status = ?, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?`,
+        ['deal_done', 'deal_done', 'in_followup', leadId],
+      );
+      await manager.query(
+        `INSERT INTO orders
+         (id, lead_id, sales_user_id, academic_user_id, service_type, amount,
+          paid_status, order_status, handover_status, remark, order_code, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+        [
+          orderId,
+          leadId,
+          salesUserId,
+          null,
+          mergedServiceType,
+          amountStr,
+          dto.paidStatus || 'unpaid',
+          'to_receive',
+          'handed_over',
+          remark,
+          orderCode,
+        ],
+      );
+
+      // v1.3 / SA-9: 创建 order_finance(订单额/已付/待付 = 订单额 - 已付 = 订单额)。
+      await manager.query(
+        `INSERT INTO order_finance
+         (id, order_id, order_amount, client_paid, client_pending,
+          teacher_price, teacher_paid, teacher_pending, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+        [
+          orderFinanceId,
+          orderId,
+          amountStr,
+          '0.00',
+          amountStr,
+          null,
+          null,
+          null,
+        ],
+      );
+
+      // v1.3 / SA-9: 落首条 order_follow_records(销售成交记录)。
+      const followContent = this.composeFollowContent(dto, generatedOrderCode);
+      const followId = makeId();
+      await manager.query(
+        `INSERT INTO order_follow_records
+         (id, order_id, user_id, node_type, content, next_remind_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+        [
+          followId,
+          orderId,
+          salesUserId,
+          '销售成交',
+          followContent,
+          dto.expectedHandleTime ? new Date(dto.expectedHandleTime) : null,
+        ],
+      );
     });
 
     // §11.1 deal_closed: 通知教务 / 主管。
     // 简化版：通知所有 academic / admin / owner 角色的用户。
+    //
+    // BF-09b 修复 (2026-06-04) — 避免 TypeORM 1.0 `this.subQuery is not a function`：
+    //   原写法 `.where('user.role IN (:...roles)', { roles: [...] })` 在 TypeORM 1.0 下
+    //   会被当成子查询构造器并调用 `this.subQuery()`，新版本该方法签名变更而抛错。
+    //   即便改成 `In([...])`，`createQueryBuilder().where({...}).getMany()` 仍会在
+    //   `addFrom` 解析时触发 `entityTarget(this.subQuery())`(QueryBuilder.js:440)，
+    //   报错依旧。最稳的绕过方式：走 `Repository.find({ where })` 不创建 QueryBuilder，
+    //   完全避开 subQuery 解析路径。
     try {
-      const receivers = await this.userRepository.find({
-        where: { role: In(['academic', 'admin', 'owner']) as any },
-        select: { id: true },
-      });
-      const ids = receivers.map((u) => u.id).filter((id) => id && id !== salesUserId);
+      // 走原始 SQL 绕开 TypeORM 1.0 `this.subQuery is not a function`（Repository.find
+      // 内部 createQueryBuilder + applyFindOptions 仍会触发 subQuery 解析路径）。
+      const rawReceivers: Array<{ id: string }> = await this.dataSource.query(
+        `SELECT id FROM users WHERE role IN (?, ?, ?)`,
+        ['academic', 'admin', 'owner'],
+      );
+      const ids = rawReceivers.map((u) => u.id).filter((id) => id && id !== salesUserId);
       if (ids.length > 0) {
         await this.notificationsService.create({
           receiverIds: ids,
@@ -169,7 +252,7 @@ export class OrdersService {
           portType: 'academic',
           typeCode: NOTIFICATION_TYPES.DEAL_CLOSED,
           title: '新订单已成交',
-          content: `客资 ${leadContact} 已成交，请尽快接单`,
+          content: `客资 ${leadContact} 已成交（订单号 ${orderCode || orderId}），请尽快接单`,
           relatedId: orderId,
           relatedType: 'order',
         });
@@ -179,7 +262,79 @@ export class OrdersService {
       console.error('[orders] notify deal closed failed', err?.message || err);
     }
 
-    return orderId;
+    return { orderId, orderCode, orderFinanceId };
+  }
+
+  /**
+   * v1.3 / SA-8: 合成 orders.remark 字段，把客户要求/产品类型/服务类型/保障类型/付款阶段
+   * 拼成结构化文本（用「||」分隔），便于教务端拆开解析。
+   * 例：`客户要求: 12周见刊 || 产品: 期刊论文 || 服务: 全流程 || 保障: 保录 || 付款: 定金 / 中期 / 尾款`
+   */
+  private composeRemark(dto: CloseDealDto): string | null {
+    const parts: string[] = [];
+    if (dto.clientRequirementNote) parts.push(`客户要求: ${dto.clientRequirementNote}`);
+    if (dto.productType) parts.push(`产品: ${dto.productType}`);
+    if (dto.serviceType && dto.serviceType !== dto.productType) parts.push(`服务: ${dto.serviceType}`);
+    if (dto.guaranteeType) parts.push(`保障: ${dto.guaranteeType}`);
+    if (dto.paymentStage) parts.push(`付款: ${dto.paymentStage}`);
+    if (dto.deliveryRequirement) parts.push(`交付要求: ${dto.deliveryRequirement}`);
+    if (parts.length === 0) return dto.remark || null;
+    return parts.join(' || ');
+  }
+
+  /**
+   * v1.3 / SA-9: 销售成交首条 order_follow_records 的 content 文本。
+   */
+  private composeFollowContent(dto: CloseDealDto, orderCode: string | null): string {
+    const codeLine = orderCode ? `订单编号 ${orderCode}` : '';
+    const amountLine = dto.amount != null && dto.amount !== '' ? `金额 ¥${dto.amount}` : '';
+    const stageLine = dto.paymentStage ? `付款阶段 ${dto.paymentStage}` : '';
+    const lines = [codeLine, amountLine, stageLine].filter(Boolean);
+    return lines.join(' | ') || '销售成交';
+  }
+
+  /**
+   * v1.3 / CROSS-4: 生成订单编号 ORD-YYYYMMDD-XXXXX。
+   * - YYYYMMDD：业务统一用 UTC+8 当日日期作为分界（与日志/前端展示一致）
+   * - XXXXX：5 位当日自增序号，从 00001 开始每日重置
+   * - 并发安全：依赖 orders_order_code_seq 单行 (seq_date) + SELECT ... FOR UPDATE 行锁
+   *   保证同一秒内多次成交不会拿到重复序号；事务内调用即可获得行锁语义。
+   *
+   * 注意：必须传入 EntityManager（来自外层 transaction 的 manager），
+   * 不能直接用 Repository 走新连接 — 否则行锁无法跨调用保持。
+   */
+  private async generateOrderCode(manager: EntityManager): Promise<string> {
+    // 业务统一用 UTC+8（北京时间）作为日期分界，避免跨时区部署时出现日期错位。
+    const now = new Date();
+    const utc8Ms = now.getTime() + 8 * 3600 * 1000;
+    const utc8 = new Date(utc8Ms);
+    const yyyy = utc8.getUTCFullYear();
+    const mm = String(utc8.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(utc8.getUTCDate()).padStart(2, '0');
+    const dateKey = `${yyyy}-${mm}-${dd}`;
+    const orderCodePrefix = `ORD-${yyyy}${mm}${dd}-`;
+
+    // 先保证当日行存在（INSERT ... ON DUPLICATE KEY UPDATE 不变更 current_seq，仅保证行可被锁）。
+    // uk_orders_order_code_seq_date 唯一索引保证每天 1 行。
+    await manager.query(
+      `INSERT INTO orders_order_code_seq (seq_date, current_seq)
+       VALUES (?, 0)
+       ON DUPLICATE KEY UPDATE seq_date = seq_date`,
+      [dateKey],
+    );
+    // 行锁：FOR UPDATE 阻塞其他事务对该行的读取，确保自增串行化。
+    const rows: Array<{ current_seq: number | string }> = await manager.query(
+      `SELECT current_seq FROM orders_order_code_seq WHERE seq_date = ? FOR UPDATE`,
+      [dateKey],
+    );
+    const raw = rows[0]?.current_seq;
+    const currentSeq = Number(raw ?? 0) || 0;
+    const nextSeq = currentSeq + 1;
+    await manager.query(
+      `UPDATE orders_order_code_seq SET current_seq = ? WHERE seq_date = ?`,
+      [nextSeq, dateKey],
+    );
+    return `${orderCodePrefix}${String(nextSeq).padStart(5, '0')}`;
   }
 
   private async getActorContext(
@@ -219,6 +374,13 @@ export class OrdersService {
    * 1.2 订单搜索/筛选：模糊搜索（订单号/客资联系方式）+ 条件搜索（付款/销售/教务/服务类型/时间）。
    * 注意：实体列名是 snake_case（o.sales_user_id / o.academic_user_id / o.paid_status 等），
    * 与 camelCase 属性不同；QueryBuilder 引用必须用数据库列名。
+   *
+   * BF-09b 修复 (2026-06-04) — 避免 TypeORM 1.0 `this.subQuery is not a function`：
+   *   旧实现用 `qb.andWhere('... EXISTS (SELECT 1 FROM leads l ...)', { kw: like })`，
+   *   TypeORM 1.0 在解析 `andWhere` 第二个参数时会把内部的 `SELECT 1` 识别为子查询并
+   *   调用 `this.subQuery(...)`，新版本下该方法签名变更而抛错。改用 QueryBuilder 的
+   *   `leftJoin + andWhere` 写法走主查询别名（参数对象用 QueryExpressionMap 内支持的
+   *   形式），避开字符串里嵌子查询的解析路径。
    */
   private applyOrderFilters(qb: any, options: ListOrdersOptions): void {
     if (options.status) {
@@ -261,20 +423,39 @@ export class OrdersService {
     }
 
     // 模糊搜索：订单号（o.id）+ 关联客资的联系方式/昵称。
-    // 用 EXISTS 关联 leads 表（已有 idx_orders_lead_id 索引），避免改变主查询结构。
+    // BF-09b 修复 (2026-06-04)：TypeORM 1.0 在 `andWhere(sql, params)` 第二参数是对象时
+    //   会把 sql 字符串里以 `(` 开头 `)` 结尾的 entity target 当作子查询构造器并
+    //   调用 `this.subQuery()`，新版本下抛 `this.subQuery is not a function`。
+    //   规避方式：只用字符串单参数 + setParameter 显式注入占位符，TypeORM 不会进入
+    //   subQuery 解析路径。子查询用 `IN (SELECT ...)` 形式（不走 EXISTS），TypeORM 把
+    //   整个 IN 子句作为字面量拼入。
+    // collation fix：leads 表 id 与 orders.id 的 collation 不一致（utf8mb4_unicode_ci
+    //   vs utf8mb4_0900_ai_ci），IN 子句里用 `CONVERT(l.id USING utf8mb4) COLLATE
+    //   utf8mb4_0900_ai_ci` 显式对齐 orders.id 的排序规则，避免 ER_CANT_AGGREGATE_2COLLATIONS。
     const kw = options.keyword && options.keyword.trim();
     if (kw) {
       const like = `%${kw}%`;
       qb.andWhere(
-        `(o.id LIKE :kw OR EXISTS (SELECT 1 FROM leads l WHERE l.id = o.lead_id AND (l.contact_info LIKE :kw OR l.nickname LIKE :kw)))`,
-        { kw: like },
+        `(o.id LIKE :kw OR o.lead_id IN (` +
+          `SELECT CONVERT(l.id USING utf8mb4) COLLATE utf8mb4_0900_ai_ci ` +
+          `FROM leads l WHERE ` +
+          `(l.contact_info LIKE :kw OR l.nickname LIKE :kw)` +
+        `))`,
       );
+      qb.setParameter('kw', like);
     }
 
     // 异常筛选：关联 order_abnormal_feedbacks 表，过滤存在未关闭异常的订单。
+    // 同样只用字符串 + setParameter 形式，避开 subQuery 解析路径。
+    // collation fix：order_abnormal_feedbacks.order_id collation 是 utf8mb4_0900_ai_ci，
+    //   orders.id 是 utf8mb4_unicode_ci，IN 子句里用 `CONVERT(f.order_id USING utf8mb4)
+    //   COLLATE utf8mb4_unicode_ci` 对齐。
     if (options.abnormal) {
       qb.andWhere(
-        `EXISTS (SELECT 1 FROM order_abnormal_feedbacks f WHERE f.order_id = o.id AND f.status != 'closed')`,
+        `o.id IN (` +
+          `SELECT CONVERT(f.order_id USING utf8mb4) COLLATE utf8mb4_unicode_ci ` +
+          `FROM order_abnormal_feedbacks f WHERE f.status != 'closed'` +
+        `)`,
       );
     }
   }
@@ -464,8 +645,9 @@ export class OrdersService {
       where: { orderId: id },
       order: { createdAt: 'DESC' },
     });
+    const names = await this.lookupUserNames([order.salesUserId, order.academicUserId]);
     return {
-      ...this.mapOrder(order),
+      ...this.mapOrder(order, names),
       followRecords: followRecords.map((r) => this.mapFollowRecord(r)),
     };
   }
@@ -600,10 +782,10 @@ export class OrdersService {
     if (current.salesUserId && current.salesUserId !== actorUserId) {
       receivers.add(current.salesUserId);
     }
-    // 主管 / 总后台兜底
+    // 主管 / 总后台兜底（BF-09b：避开 TypeORM 1.0 `this.subQuery is not a function`，改用 Repository.find）
     try {
       const supervisors = await this.userRepository.find({
-        where: { role: In(['admin', 'owner']) as any },
+        where: { role: In(['admin', 'owner']) },
         select: { id: true },
       });
       for (const u of supervisors) {
@@ -682,14 +864,13 @@ export class OrdersService {
       // 若失败不影响主流程（仍保存 follow record），仅 auto-accept 不生效。
       if (order.academicUserId == null && actorUserId) {
         try {
-          const actorCtx = await this.getActorContext(actorUserId);
-          // 用 employeeId 优先；缺 employeeId 时兜底用 userId（与历史数据兼容）
-          const targetEmployeeId = actorCtx.employeeId || actorUserId;
+          // 统一存 users.id：与 canAccessOrder / acceptHandover / closeDeal 落库保持一致
+          // 历史数据兜底：缺 userId 时退到 employeeId（兼容老记录）
           await this.orderRepository.update(
             { id: orderId },
-            { academicUserId: targetEmployeeId },
+            { academicUserId: actorUserId },
           );
-          order.academicUserId = targetEmployeeId;
+          order.academicUserId = actorUserId;
         } catch (err: any) {
           // eslint-disable-next-line no-console
           console.error(
@@ -813,9 +994,10 @@ export class OrdersService {
     // service 层只负责业务状态翻转，避免双写。
 
     // 通知所有教务/主管：有新订单待接收。
+    // BF-09b：避开 TypeORM 1.0 `this.subQuery is not a function`，改用 Repository.find。
     try {
       const receivers = await this.userRepository.find({
-        where: { role: In(['academic', 'admin', 'owner']) as any },
+        where: { role: In(['academic', 'admin', 'owner']) },
         select: { id: true },
       });
       const ids = receivers.map((u) => u.id).filter((id) => id && id !== actorUserId);
@@ -844,8 +1026,8 @@ export class OrdersService {
    * P0-NEW-03 修复：原代码无 owner 校验，任意登录用户都能把任意订单置为 accepted。
    * 修复后：
    *   - admin/owner：旁路 ownership
-   *   - academic：仅当 order.academicUserId === actor.employeeId（不是 userId，
-   *     因为 orders.academic_user_id 存的是 employees.id）
+   *   - academic：仅当 order.academicUserId === actor.userId（统一存 users.id，
+   *     与 canAccessOrder / 池单自动认领 / closeDeal 落库保持一致）
    *   - 其他角色：403
    * 状态机收紧：仅 'handed_over' 可 accept，'pending'（未先 hand-over）也拒绝；
    * 'accepted' 幂等；'rejected' 必须先重新发起 hand-over。
@@ -871,7 +1053,10 @@ export class OrdersService {
       if (ctx.role && ctx.role !== 'academic') {
         throw new ForbiddenException('only academic or supervisor can accept handover');
       }
-      if (order.academicUserId !== ctx.employeeId) {
+      // 统一用 actorUserId（与 orders.academic_user_id 落库值一致）；
+      // 历史数据若仍存 employeeId，用 ctx.employeeId 兜底兼容（迁移窗口期）
+      const actorKey = actorUserId || ctx.employeeId;
+      if (order.academicUserId !== actorKey) {
         throw new ForbiddenException('only the assigned academic can accept handover');
       }
     }
@@ -1008,20 +1193,118 @@ export class OrdersService {
     };
   }
 
-  private mapOrder(row: Order): any {
+  // ============================================================
+  // v1.3 / SA-7: 销售"我的成交"列表
+  // 只查 orders.sales_user_id = currentUser 的订单（与 closeDeal 落库保持一致）。
+  // 支持时间/产品类型/订单状态筛选，导出 Excel 走 sales.controller 的 createExport。
+  // ============================================================
+
+  async listMyDeals(salesUserId: string, options: {
+    status?: string;
+    productType?: string;
+    startDate?: string;
+    endDate?: string;
+    limit: number;
+    offset: number;
+  }): Promise<{ items: any[]; total: number; limit: number; offset: number }> {
+    const safeLimit = this.clampLimit(options.limit);
+    const safeOffset = Math.max(Number(options.offset) || 0, 0);
+    if (!salesUserId) return { items: [], total: 0, limit: safeLimit, offset: safeOffset };
+    const qb = this.orderRepository.createQueryBuilder('o')
+      .where('o.sales_user_id = :uid', { uid: salesUserId });
+    if (options.status && ALLOWED_ORDER_STATUS.includes(options.status as OrderStatus)) {
+      qb.andWhere('o.order_status = :status', { status: options.status });
+    }
+    if (options.productType) {
+      // 产品类型藏在 service_type 或 remark 里（详见 closeDeal.composeRemark）
+      qb.andWhere(
+        '(o.service_type = :productType OR o.remark LIKE :productTypeLike)',
+        { productType: options.productType, productTypeLike: `%产品: ${options.productType}%` },
+      );
+    }
+    if (options.startDate) qb.andWhere('o.created_at >= :startDate', { startDate: options.startDate });
+    if (options.endDate) qb.andWhere('o.created_at <= :endDate', { endDate: options.endDate });
+    // 销售/教务展示姓名：LEFT JOIN users 取 username。
+    // 注意：orders / users 两表 collation 不同（utf8mb4_unicode_ci vs utf8mb4_0900_ai_ci），
+    // ON 条件必须显式 COLLATE，否则 MySQL 抛 ER_CANT_AGGREGATE_2COLLATIONS。
+    // 用同一个别名 u 同时 join 两列，省一次 JOIN。
+    qb.leftJoin('users', 'u', 'u.id COLLATE utf8mb4_unicode_ci = o.academic_user_id COLLATE utf8mb4_unicode_ci')
+      .addSelect('u.username', 'academic_user_name');
+    qb.orderBy('o.created_at', 'DESC')
+      .addOrderBy('o.id', 'DESC')
+      .take(safeLimit)
+      .skip(safeOffset);
+    const [rows, total] = await qb.getManyAndCount();
+    const namesRaw = await qb.getRawMany();
+    const academicNameByOrderId = new Map<string, string | null>();
+    for (const raw of namesRaw) {
+      const orderId = raw['o_id'] || raw['o_id' as string];
+      if (orderId) academicNameByOrderId.set(String(orderId), raw['academic_user_name'] || null);
+    }
+    // 销售姓名批量查（PK 查不会触发跨表 collation 冲突）
+    const salesUserIds = Array.from(new Set(rows.map((r) => r.salesUserId).filter(Boolean) as string[]));
+    const salesUserList = salesUserIds.length
+      ? await this.userRepository.find({
+          where: salesUserIds.map((id) => ({ id })),
+          select: { id: true, username: true },
+        })
+      : [];
+    const salesNameById = new Map(salesUserList.map((u) => [u.id, u.username]));
+    return {
+      items: rows.map((r) =>
+        this.mapOrder(r, {
+          academicUserName: academicNameByOrderId.get(r.id) || null,
+          salesUserName: r.salesUserId ? salesNameById.get(r.salesUserId) || null : null,
+        }),
+      ),
+      total,
+      limit: safeLimit,
+      offset: safeOffset,
+    };
+  }
+
+  private mapOrder(row: Order, names: { salesUserName?: string | null; academicUserName?: string | null } = {}): any {
     return {
       id: row.id,
       leadId: row.leadId,
       salesUserId: row.salesUserId,
+      salesUserName: names.salesUserName ?? null,
       academicUserId: row.academicUserId,
+      academicUserName: names.academicUserName ?? null,
       serviceType: row.serviceType,
       amount: row.amount,
       paidStatus: row.paidStatus,
       orderStatus: row.orderStatus,
       handoverStatus: row.handoverStatus,
       remark: row.remark,
+      orderCode: row.orderCode,
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
+    };
+  }
+
+  /**
+   * 批量查 users 表，把 userId 列表映射成 { id -> username }。
+   * 用于给订单详情 / 我的成交返回「销售」「教务」的真实姓名，避免前端显示裸 ID。
+   * 注意：跨表 collation 不一致（orders=unicode_ci vs users=0900_ai_ci），
+   *       用 IN-list 主键查询走 PK 不会触发 collation 冲突。
+   */
+  private async lookupUserNames(
+    userIds: Array<string | null | undefined>,
+  ): Promise<{ salesUserName: string | null; academicUserName: string | null }> {
+    const ids = Array.from(new Set(userIds.filter((v): v is string => !!v)));
+    if (ids.length === 0) {
+      return { salesUserName: null, academicUserName: null };
+    }
+    const users = await this.userRepository.find({
+      where: ids.map((id) => ({ id })),
+      select: { id: true, username: true },
+    });
+    const byId = new Map<string, string>();
+    for (const u of users) byId.set(u.id, u.username);
+    return {
+      salesUserName: byId.get(userIds[0] || '') ?? null,
+      academicUserName: byId.get(userIds[1] || '') ?? null,
     };
   }
 
