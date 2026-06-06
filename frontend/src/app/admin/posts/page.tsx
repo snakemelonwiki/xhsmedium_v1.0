@@ -14,8 +14,10 @@ import {
   Empty,
   Image,
   Input,
+  InputNumber,
   Modal,
   Pagination,
+  Radio,
   Select,
   Space,
   Spin,
@@ -43,6 +45,9 @@ const PAGE_SIZE_OPTIONS = [15, 30, 50, 100];
 
 type PeriodKey = 'today' | 'week' | 'month' | 'all' | 'custom';
 
+type LeadPostMetric = 'leadsCount' | 'traffic';
+type LeadPostOperator = 'gt' | 'gte' | 'eq' | 'lte' | 'lt';
+
 type Filters = {
   period: PeriodKey;
   customRange: [string, string] | null;
@@ -50,7 +55,9 @@ type Filters = {
   employeeId: string;
   accountId: string;
   postType: string;
-  isLeadPost: string;
+  leadPostMetric: LeadPostMetric;
+  leadPostOperator: LeadPostOperator;
+  leadPostThreshold: number | null;
   keyword: string;
 };
 
@@ -61,7 +68,9 @@ const EMPTY_FILTERS: Filters = {
   employeeId: '',
   accountId: '',
   postType: '',
-  isLeadPost: '',
+  leadPostMetric: 'leadsCount',
+  leadPostOperator: 'gte',
+  leadPostThreshold: null,
   keyword: '',
 };
 
@@ -79,10 +88,17 @@ const postTypeOptions = [
   { label: '日常', value: '日常' },
 ];
 
-const isLeadPostOptions = [
-  { label: '全部', value: '' },
-  { label: '获客贴(≥5)', value: 'yes' },
-  { label: '普通贴(<5)', value: 'no' },
+const leadPostMetricOptions: { label: string; value: LeadPostMetric }[] = [
+  { label: '客资数', value: 'leadsCount' },
+  { label: '流量数', value: 'traffic' },
+];
+
+const leadPostOperatorOptions: { label: string; value: LeadPostOperator }[] = [
+  { label: '>', value: 'gt' },
+  { label: '≥', value: 'gte' },
+  { label: '=', value: 'eq' },
+  { label: '≤', value: 'lte' },
+  { label: '<', value: 'lt' },
 ];
 
 function formatDate(value?: string): string {
@@ -124,6 +140,10 @@ function getPeriodLabel(period: PeriodKey): string {
   if (period === 'month') return '本月';
   if (period === 'custom') return '自定义';
   return '累计';
+}
+
+function isLongPostTitle(title?: string): boolean {
+  return Array.from(title || '').length > 12;
 }
 
 type Post = {
@@ -252,11 +272,26 @@ export default function AdminPostsPage() {
       const data = payload?.items ?? payload ?? [];
       let posts = Array.isArray(data) ? data : [];
 
-      // 前端筛选获客贴
-      if (filters.isLeadPost === 'yes') {
-        posts = posts.filter((p: any) => (p.leadsCount ?? p.leadCount ?? 0) >= 5);
-      } else if (filters.isLeadPost === 'no') {
-        posts = posts.filter((p: any) => (p.leadsCount ?? p.leadCount ?? 0) < 5);
+      // 前端筛选：按 (指标, 关系, 阈值) 三件套过滤
+      if (filters.leadPostThreshold !== null && filters.leadPostThreshold !== undefined) {
+        const threshold = filters.leadPostThreshold;
+        const metricKey = filters.leadPostMetric;
+        posts = posts.filter((p: any) => {
+          let value: number;
+          if (metricKey === 'leadsCount') {
+            value = Number(p.leadsCount ?? p.leadCount ?? p.leads_count ?? 0);
+          } else {
+            value = Number(p.traffic ?? p.views ?? 0);
+          }
+          switch (filters.leadPostOperator) {
+            case 'gt': return value > threshold;
+            case 'gte': return value >= threshold;
+            case 'eq': return value === threshold;
+            case 'lte': return value <= threshold;
+            case 'lt': return value < threshold;
+            default: return true;
+          }
+        });
       }
 
       // 映射数据
@@ -331,7 +366,9 @@ export default function AdminPostsPage() {
     filters.employeeId,
     filters.accountId,
     filters.postType,
-    filters.isLeadPost,
+    filters.leadPostMetric,
+    filters.leadPostOperator,
+    filters.leadPostThreshold,
     filters.period,
     filters.customRange,
     filters.keyword,
@@ -417,7 +454,6 @@ export default function AdminPostsPage() {
       });
       if (filters.accountId) filter.accountId = filters.accountId;
       if (filters.postType) filter.postType = filters.postType;
-      if (filters.isLeadPost) filter.isLeadPost = filters.isLeadPost;
       if (from) filter.from = from;
       if (to) filter.to = to;
       const result = await createExport({ exportType: 'posts', filter });
@@ -519,30 +555,34 @@ export default function AdminPostsPage() {
     {
       title: '作品',
       dataIndex: 'title',
-      width: 340,
+      width: 200,
       render: (v: string, r: Post) => (
-        <Space size={10} align="start">
+        <Space size={6} align="start">
           {r.coverThumbUrl || r.coverImageUrl ? (
             <Image
               src={r.coverThumbUrl || r.coverImageUrl}
               alt="封面"
-              width={92}
-              height={66}
+              width={56}
+              height={42}
               style={{ objectFit: 'cover', borderRadius: 6, flex: '0 0 auto' }}
               preview={{ mask: <EyeOutlined /> }}
             />
           ) : (
-            <div style={{ width: 92, height: 66, background: '#f0f0f0', borderRadius: 6, flex: '0 0 auto' }} />
+            <div style={{ width: 56, height: 42, background: '#f0f0f0', borderRadius: 6, flex: '0 0 auto' }} />
           )}
           <Space direction="vertical" size={2} style={{ minWidth: 0 }}>
             {r.postUrl ? (
               <a href={r.postUrl} target="_blank" rel="noreferrer">
-                <Typography.Text strong ellipsis style={{ maxWidth: 220 }}>{v}</Typography.Text>
+                <Tooltip placement="top" title={isLongPostTitle(v) ? v : undefined}>
+                  <Typography.Text strong ellipsis style={{ maxWidth: 120 }}>{v}</Typography.Text>
+                </Tooltip>
               </a>
             ) : (
-              <Typography.Text strong ellipsis style={{ maxWidth: 220 }}>{v}</Typography.Text>
+              <Tooltip placement="top" title={isLongPostTitle(v) ? v : undefined}>
+                <Typography.Text strong ellipsis style={{ maxWidth: 120 }}>{v}</Typography.Text>
+              </Tooltip>
             )}
-            <Typography.Text type="secondary" ellipsis style={{ maxWidth: 220, fontSize: 12 }}>
+            <Typography.Text type="secondary" ellipsis style={{ maxWidth: 120, fontSize: 12 }}>
               {r.copywriting || r.note || '暂无文案'}
             </Typography.Text>
             {Number(r.isSupervisorPicked || 0) === 1 ? <Tag color="gold">优秀作品</Tag> : null}
@@ -568,20 +608,7 @@ export default function AdminPostsPage() {
       dataIndex: 'publishedAt',
       width: 110,
       ...sortColumn('publishedAt'),
-      render: (v?: string, r?: Post) => {
-        if (!r) return formatDate(v);
-        const isPicked = Number(r.isSupervisorPicked || 0) === 1;
-        return (
-          <Space size={4}>
-            {isPicked ? (
-              <Tooltip title="已被主管标记为优秀作品">
-                <StarFilled style={{ color: '#faad14' }} />
-              </Tooltip>
-            ) : null}
-            <span>{formatDate(v)}</span>
-          </Space>
-        );
-      },
+      render: (v?: string) => formatDate(v),
     },
     {
       title: '流量',
@@ -718,13 +745,32 @@ export default function AdminPostsPage() {
             showSearch
             optionFilterProp="label"
           />
-          <Select
-            value={filters.isLeadPost}
-            options={isLeadPostOptions}
-            onChange={(value) => setFilters((prev) => ({ ...prev, isLeadPost: value }))}
-            style={{ width: 140 }}
-            placeholder="获客贴"
-          />
+          <Space size={8} wrap>
+            <Radio.Group
+              value={filters.leadPostMetric}
+              onChange={(e) => setFilters((prev) => ({ ...prev, leadPostMetric: e.target.value }))}
+              optionType="button"
+              size="small"
+              options={leadPostMetricOptions}
+            />
+            <Radio.Group
+              value={filters.leadPostOperator}
+              onChange={(e) => setFilters((prev) => ({ ...prev, leadPostOperator: e.target.value }))}
+              optionType="button"
+              size="small"
+              options={leadPostOperatorOptions}
+            />
+            <InputNumber
+              value={filters.leadPostThreshold ?? undefined}
+              onChange={(value) =>
+                setFilters((prev) => ({ ...prev, leadPostThreshold: value === null ? null : Number(value) }))
+              }
+              placeholder="数量"
+              min={0}
+              size="small"
+              style={{ width: 100 }}
+            />
+          </Space>
           <QuickRangePicker
             value={filters.period === 'custom' && filters.customRange
               ? { start: dayjs(filters.customRange[0]), end: dayjs(filters.customRange[1]) }
@@ -951,8 +997,13 @@ export default function AdminPostsPage() {
                   ? { label: '账号', value: accountMap.get(filters.accountId) || filters.accountId }
                   : null,
                 filters.postType ? { label: '作品类型', value: filters.postType } : null,
-                filters.isLeadPost
-                  ? { label: '获客贴', value: filters.isLeadPost === 'yes' ? '获客贴(≥5)' : '普通贴(<5)' }
+                filters.leadPostThreshold !== null && filters.leadPostThreshold !== undefined
+                  ? {
+                      label: '指标筛选',
+                      value: `${filters.leadPostMetric === 'leadsCount' ? '客资数' : '流量数'} ${
+                        { gt: '>', gte: '≥', eq: '=', lte: '≤', lt: '<' }[filters.leadPostOperator]
+                      } ${filters.leadPostThreshold}`,
+                    }
                   : null,
                 (() => {
                   const { from, to } = resolvePeriodRange(filters.period, filters.customRange);
@@ -976,7 +1027,6 @@ export default function AdminPostsPage() {
                 filters.employeeId,
                 filters.accountId,
                 filters.postType,
-                filters.isLeadPost,
                 filters.period !== 'all' ? filters.period : '',
               ].filter(Boolean).length && (
                 <Typography.Text type="secondary">无筛选条件（将导出全部作品）</Typography.Text>
