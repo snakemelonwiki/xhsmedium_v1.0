@@ -93,6 +93,13 @@ export const APP_MENU_ITEMS: AppMenuItem[] = [
     roles: ['operation'],
   },
   {
+    key: 'operation-collaboration',
+    label: '协同处理',
+    path: '/operation/collaboration',
+    icon: <ProjectOutlined />,
+    roles: ['operation'],
+  },
+  {
     key: 'operation-posts',
     label: '我的作品',
     path: '/operation/posts',
@@ -139,6 +146,13 @@ export const APP_MENU_ITEMS: AppMenuItem[] = [
     label: '我的客资',
     path: '/sales/leads',
     icon: <UsergroupAddOutlined />,
+    roles: ['sales'],
+  },
+  {
+    key: 'sales-lead-followup',
+    label: '客资跟进',
+    path: '/sales/lead-followup',
+    icon: <ScheduleOutlined />,
     roles: ['sales'],
   },
   {

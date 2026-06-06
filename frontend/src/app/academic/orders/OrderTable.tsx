@@ -1,18 +1,36 @@
 'use client';
 
 import { DownloadOutlined, ReloadOutlined } from '@ant-design/icons';
-import { Alert, Button, Card, DatePicker, Input, Modal, Pagination, Select, Space, Table, Tag, Typography, message } from 'antd';
+import { Alert, Button, Card, Input, Modal, Pagination, Select, Space, Table, Tag, Typography, message } from 'antd';
 import type { TableColumnsType } from 'antd';
-import type { Dayjs } from 'dayjs';
 import { useRouter } from 'next/navigation';
 import { useEffect, useMemo, useState } from 'react';
 
 import { listOrders, updateOrder } from '@/shared/api/orders';
+import { updateLeadDealStatus } from '@/shared/api/leads';
 import { createExport, downloadExportUrl, getExport, type ExportFilter } from '@/shared/api/exports';
 import { readStoredUser } from '@/shared/auth/auth';
 import type { OrderItem, OrderScope, OrderStatusCode } from '@/shared/types/orders';
 import { HANDOVER_STATUS_OPTIONS, HandoverStatusCode, handoverStatusMeta, orderStatusMeta, paidStatusMeta } from '@/shared/api/enums';
 import { formatDateTime } from '@/shared/utils/date-format';
+import { QuickRangePicker } from '@/shared/components/date';
+import type { DateRangeValue } from '@/shared/components/date';
+
+const dealStatusOptions = [
+  { label: '未成交', value: 'not_deal' },
+  { label: '待成交', value: 'deal_pending' },
+  { label: '已成交', value: 'deal_done' },
+  { label: '已退款', value: 'refunded' },
+  { label: '无效', value: 'invalid' },
+];
+
+const dealStatusMeta: Record<string, { label: string; color: string }> = {
+  not_deal: { label: '未成交', color: 'default' },
+  deal_pending: { label: '待成交', color: 'orange' },
+  deal_done: { label: '已成交', color: 'green' },
+  refunded: { label: '已退款', color: 'magenta' },
+  invalid: { label: '无效', color: 'red' },
+};
 
 const orderStatusOptions: { label: string; value: OrderStatusCode }[] = [
   { label: '待领取', value: 'to_receive' },
@@ -43,6 +61,12 @@ interface OrderTableProps {
 // 列表渲染使用集中 helper（v1.3 P0 修复后），避免和 enums.ts 重复维护。
 function renderOrderStatus(status: string) {
   const meta = orderStatusMeta(status);
+  return <Tag color={meta.color}>{meta.label}</Tag>;
+}
+
+function renderDealStatus(status?: string | null) {
+  const code = status || 'not_deal';
+  const meta = dealStatusMeta[code] || { label: code, color: 'default' };
   return <Tag color={meta.color}>{meta.label}</Tag>;
 }
 
@@ -83,7 +107,7 @@ export function OrderTable({ title, description, scope, status, showStatusFilter
   const [assignAcademicUserId, setAssignAcademicUserId] = useState('');
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const [exportSubmitting, setExportSubmitting] = useState(false);
-  const [exportRange, setExportRange] = useState<[Dayjs, Dayjs] | null>(null);
+  const [exportRange, setExportRange] = useState<DateRangeValue>(null);
   const [exportStatus, setExportStatus] = useState<string>('');
   const [exportPaidStatus, setExportPaidStatus] = useState<string>('');
 
@@ -117,6 +141,23 @@ export function OrderTable({ title, description, scope, status, showStatusFilter
       message.error(text);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function patchDealStatus(order: OrderItem, dealStatus: string, successText: string) {
+    if (!order.leadId) {
+      message.error('订单缺少关联客资，无法更新成交状态');
+      return;
+    }
+    setUpdatingId(order.id);
+    try {
+      await updateLeadDealStatus(String(order.leadId), { dealStatus: dealStatus as any });
+      message.success(successText);
+      await loadOrders();
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : '成交状态更新失败');
+    } finally {
+      setUpdatingId('');
     }
   }
 
@@ -169,8 +210,8 @@ export function OrderTable({ title, description, scope, status, showStatusFilter
       if (exportStatus) filter.status = exportStatus;
       if (exportPaidStatus) filter.paidStatus = exportPaidStatus;
       if (exportRange) {
-        filter.from = exportRange[0].startOf('day').toISOString();
-        filter.to = exportRange[1].endOf('day').toISOString();
+        filter.from = exportRange.start.startOf('day').toISOString();
+        filter.to = exportRange.end.endOf('day').toISOString();
       }
       const result = await createExport({ exportType: 'orders', filter });
 
@@ -284,7 +325,7 @@ export function OrderTable({ title, description, scope, status, showStatusFilter
       title: '操作',
       key: 'actions',
       fixed: 'right',
-      width: actionMode === 'admin' ? 150 : 210,
+      width: actionMode === 'sales' ? 320 : (actionMode === 'admin' ? 150 : 210),
       render: (_value, record) => {
         if (actionMode === 'admin') {
           return (
@@ -477,10 +518,11 @@ export function OrderTable({ title, description, scope, status, showStatusFilter
             <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 4 }}>
               时间范围
             </Typography.Text>
-            <DatePicker.RangePicker
+            <QuickRangePicker
               value={exportRange}
-              onChange={(range) => setExportRange((range as [Dayjs, Dayjs]) || null)}
+              onChange={setExportRange}
               style={{ width: '100%' }}
+              pickerProps={{ style: { width: '100%' } }}
             />
           </div>
         </Space>

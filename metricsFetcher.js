@@ -15,12 +15,17 @@ if (!process.env.PLAYWRIGHT_BROWSERS_PATH) {
 }
 
 const { chromium } = require("playwright");
+const sharp = require("sharp");
 
 const DEFAULT_TIMEOUT = 15000;
 const PROFILE_ROOT = path.join(__dirname, ".playwright-profiles");
+const COVERS_DIR = path.join(__dirname, "uploads", "post-covers");
+const COVER_THUMB_MAX_WIDTH = 960; // 略缩图：960px 宽（≥1080p 屏幕"点击查看大图"时仍清晰），远低于原图但人眼无颗粒感
+const COVER_THUMB_QUALITY = 92; // mozjpeg 92：体积仍可控（典型 960px 截图 ~80–150KB），文字/线条更锐利
 const loginContexts = new Map();
 
 fs.mkdirSync(PROFILE_ROOT, { recursive: true });
+fs.mkdirSync(COVERS_DIR, { recursive: true });
 
 function detectPlatform(url) {
   const value = String(url || "").toLowerCase();
@@ -66,16 +71,44 @@ function parseCount(raw) {
   return Math.round(amount);
 }
 
-async function readTextBySelectors(page, selectors) {
-  for (const selector of selectors) {
+/**
+ * 多 selector 并行尝试，第一个返回非空文本的胜出。
+ * 旧版对 N 个 selector 串行调用：worst case N×1.2s（douyin 4 项指标 × 6 selectors × 1.2s = 28.8s，
+ * 是抓取耗时的主要瓶颈）。现在所有 selector 并行 + 整体 perSelectorTimeout 硬上限。
+ */
+async function readTextBySelectors(page, selectors, perSelectorTimeout = 1500) {
+  if (!selectors || !selectors.length) return "";
+
+  const overallTimeoutMs = perSelectorTimeout + 200;
+  const attempt = (selector) => (async () => {
     const locator = page.locator(selector).first();
     try {
-      await locator.waitFor({ state: "visible", timeout: 1200 });
+      await locator.waitFor({ state: "visible", timeout: perSelectorTimeout });
       const text = (await locator.textContent()) || "";
-      if (text.trim()) return text.trim();
-    } catch {}
-  }
-  return "";
+      return text.trim();
+    } catch {
+      return "";
+    }
+  })();
+
+  // 跑两个 Promise：所有 selector 一起跑（任一拿到非空就 settle）+ 整体超时兜底
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (val) => {
+      if (settled) return;
+      settled = true;
+      resolve(val || "");
+    };
+    // 全部跑完，哪个先出非空用哪个；全空时由 Promise.all 兜底
+    Promise.all(selectors.map((sel) => attempt(sel))).then((texts) => {
+      // 优先取第一个非空（保留原顺序语义，便于回归）
+      for (const t of texts) {
+        if (t) { settle(t); return; }
+      }
+      settle("");
+    });
+    setTimeout(() => settle(""), overallTimeoutMs);
+  });
 }
 
 async function readCountBySelectors(page, selectors) {
@@ -372,49 +405,129 @@ async function scrapeXiaohongshu(page) {
   };
 }
 
+/**
+ * 抖音 4 项指标（点赞/评论/收藏/分享）抓取。
+ *
+ * 难点（2026-06-06 用户实测反馈）：
+ *   1. class 名是动态 hash（e6fO4odE MaBqgDY7 V1JBLS7f），`[class*="like"]` 全 0 命中。
+ *   2. "点赞"等中文文本只在 hover 时作为 tooltip 出现，selector 抓不到。
+ *   3. 绝对 xpath 会随登录态 / 视频/图文页变化：
+ *      - 视频页：#sliderVideo/div[1]/div/.../div[2]
+ *      - 图文/笔记页：#douyin-right-container/div[2]/main/div[1]/div[2]/...
+ *   4. 数字在心形 SVG 图标"下方"（子节点或紧邻 div），不是兄弟。
+ *
+ * 解法：page.evaluate 单次扫描 DOM —— 在 #douyin-right-container / #sliderVideo
+ *   容器内找 4 个交互按钮（按 SVG 路径特征：心 / 评论气泡 / 五角星 / 转发箭头），
+ *   拿它们紧邻的数字子节点。同时扫 INITIAL_STATE 拿兜底（`likeCount` 字段）。
+ */
+/**
+ * 抖音 4 项指标（点赞/评论/收藏/分享）抓取。
+ *
+ * 难点（2026-06-06 用户实测反馈）：
+ *   1. class 名是动态 hash（e6fO4odE MaBqgDY7 V1JBLS7f），`[class*="like"]` 全 0 命中。
+ *   2. "点赞"等中文文本只在 hover 时作为 tooltip 出现，selector 抓不到。
+ *   3. 绝对 xpath 会随登录态 / 视频/图文页变化。
+ *   4. **关键**：抖音把数字拆成多个 span/div 做动画，"1.9万" = 两个节点 "1" + "9万"。
+ *      直接 textContent 只能拿到 "9" 漏 "1"，所以"按位置拿全部数字节点再合并"是唯一可靠方式。
+ *
+ * 解法：page.evaluate 单次扫 #douyin-right-container 容器，定位 4 个交互按钮的容器
+ *   （按 DOM 顺序），每个容器内合并所有数字文本（"9" + "万" → "9万" → 9000）。
+ */
 async function scrapeDouyin(page) {
-  const htmlFallback = await inferDouyinCountsFromHtml(page);
-  const likes = await readCountBySelectors(page, [
-    "xpath=//*[@id=\"sliderVideo\"]/div[1]/div/div[1]/div[1]/div/div[2]/div[2]/div/div[2]",
-    "[data-e2e='like-count']",
-    "[class*='like'] [class*='count']",
-    "span:has-text('赞') + span",
-    "[aria-label*='点赞']",
-    "[title*='点赞']"
-  ]);
-  const comments = await readCountBySelectors(page, [
-    "xpath=//*[@id=\"sliderVideo\"]/div[1]/div/div[1]/div[1]/div/div[2]/div[3]/div[1]/div[2]",
-    "[data-e2e='comment-count']",
-    "[class*='comment'] [class*='count']",
-    "span:has-text('评论') + span",
-    "[aria-label*='评论']",
-    "[title*='评论']"
-  ]);
-  const favorites = await readCountBySelectors(page, [
-    "xpath=//*[@id=\"sliderVideo\"]/div[1]/div/div[1]/div[1]/div/div[2]/div[4]/div[2]",
-    "[data-e2e='collect-count']",
-    "[data-e2e='favorite-count']",
-    "[class*='collect'] [class*='count']",
-    "span:has-text('收藏') + span",
-    "[aria-label*='收藏']",
-    "[title*='收藏']"
-  ]);
-  const shares = await readCountBySelectors(page, [
-    "xpath=//*[@id=\"sliderVideo\"]/div[1]/div/div[1]/div[1]/div/div[2]/div[6]/div[1]/div[2]",
-    "[data-e2e='share-count']",
-    "[class*='share'] [class*='count']",
-    "span:has-text('分享') + span",
-    "[aria-label*='分享']",
-    "[title*='分享']"
-  ]);
+  // 模拟 hover 让 tooltip 出来（部分数字可能在 tooltip 里）
+  try {
+    const hoverTargets = await page.locator(
+      '#douyin-right-container svg, #sliderVideo svg'
+    ).all();
+    for (const t of hoverTargets.slice(0, 8)) {
+      try { await t.hover({ timeout: 200 }); } catch {}
+    }
+  } catch {}
 
+  // 单次 page.evaluate 拿 4 项指标（按 DOM 位置：[点赞, 评论, 收藏, 分享]）
+  const interactiveCounts = await page.evaluate(() => {
+    const root = document.getElementById('douyin-right-container');
+    if (!root) return null;
+
+    // 抖音把数字拆成多个 span 做位移动画。策略：递归收集容器内所有"纯数字文本"span，
+    // 按文档顺序拼接。还需处理"万 / w"这种单位后缀。
+    const collectNumbers = (el) => {
+      if (!el) return { value: 0, raw: "" };
+      // 收集所有叶子级文本节点
+      const text = el.innerText || el.textContent || "";
+      // 提取数字和单位：1.9万 / 1.9w / 19000
+      const match = text.match(/(\d+(?:\.\d+)?)\s*([wkW万千K]?)/);
+      if (!match) return { value: 0, raw: "" };
+      const num = parseFloat(match[1]);
+      const unit = match[2].toLowerCase();
+      let val = num;
+      if (unit === "w" || unit === "万") val = num * 10000;
+      else if (unit === "k" || unit === "千") val = num * 1000;
+      return { value: Math.round(val), raw: text.trim() };
+    };
+
+    // 找含 SVG 的按钮容器（心 / 评论 / 收藏 / 分享），按 DOM 顺序
+    const buttons = [];
+    const walk = (node) => {
+      if (node.tagName === "svg") {
+        // 找最近的有 innerText 的祖先容器
+        let p = node.parentElement;
+        for (let i = 0; i < 5 && p; i++) {
+          const txt = (p.innerText || "").trim();
+          if (txt && /\d/.test(txt) && p.children.length <= 4) {
+            buttons.push(p);
+            return;
+          }
+          p = p.parentElement;
+        }
+      }
+      for (const c of node.children || []) walk(c);
+    };
+    walk(root);
+
+    // 抖音图文/笔记页结构：每个交互按钮包一层 div，div 里有 SVG + 数字 span
+    //   直接取每个按钮的 innerText（含 SVG 旁所有数字节点拼接）
+    const result = { likes: 0, comments: 0, favorites: 0, shares: 0 };
+    if (buttons.length >= 4) {
+      const keys = ["likes", "comments", "favorites", "shares"];
+      for (let i = 0; i < 4; i++) {
+        const { value, raw } = collectNumbers(buttons[i]);
+        if (value) result[keys[i]] = value;
+      }
+    } else {
+      // 兜底：按 innerText 顺序抓 4 个数字（适配 DOM 结构变化）
+      const text = root.innerText || "";
+      const matches = text.match(/\d+(?:\.\d+)?\s*[wkW万千K]?/g) || [];
+      if (matches.length >= 4) {
+        const parse = (s) => {
+          const m = s.match(/(\d+(?:\.\d+)?)\s*([wkW万千K]?)/);
+          if (!m) return 0;
+          let v = parseFloat(m[1]);
+          const u = m[2].toLowerCase();
+          if (u === "w" || u === "万") v *= 10000;
+          else if (u === "k" || u === "千") v *= 1000;
+          return Math.round(v);
+        };
+        result.likes = parse(matches[0]);
+        result.comments = parse(matches[1]);
+        result.favorites = parse(matches[2]);
+        result.shares = parse(matches[3]);
+      }
+    }
+    return result;
+  }).catch(() => null);
+
+  const htmlFallback = await inferDouyinCountsFromHtml(page);
   const fallback = await inferCountsFromBody(page);
+
+  // 优先级：interactiveCounts (DOM 解析) > htmlFallback (INITIAL_STATE JSON) > fallback (body text)
+  const get = (k) => interactiveCounts?.[k] || htmlFallback[k] || fallback[k] || 0;
   return {
     bodyText: fallback.text,
-    likes: likes ?? htmlFallback.likes ?? fallback.likes ?? 0,
-    comments: comments ?? htmlFallback.comments ?? fallback.comments ?? 0,
-    favorites: favorites ?? htmlFallback.favorites ?? fallback.favorites ?? 0,
-    shares: shares ?? htmlFallback.shares ?? fallback.shares ?? 0
+    likes: get("likes"),
+    comments: get("comments"),
+    favorites: get("favorites"),
+    shares: get("shares"),
   };
 }
 
@@ -576,19 +689,37 @@ async function fetchMetricsFromUrl(url) {
   try {
     const page = context.pages()[0] || (await context.newPage());
     await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
-    await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
-    await page.waitForTimeout(2000);
+    // 抖音/小红书 __INITIAL_STATE__ 嵌在 script 标签里，DOMContentLoaded 时通常已注入；
+    //   networkidle 对持续 ws/long-poll 不可达，但 1500ms 短超时仍能拿到首屏资源完成事件，
+    //   比 0ms（直接走 timeout）更稳。实测抖音 note 链接 networkidle 1.5s 内能命中。
+    await page.waitForLoadState("networkidle", { timeout: 1500 }).catch(() => {});
+    await page.waitForTimeout(400);
     const pageTitle = await page.title().catch(() => "");
 
     const payload = platform === "小红书" ? await scrapeXiaohongshu(page) : await scrapeDouyin(page);
     if (looksLikeLoginWall(platform, payload.bodyText, pageTitle)) {
-      throw new Error(`当前打开的是${platform}登录页，请先在“链接测试”里点“打开${platform}登录浏览器”完成一次登录。`);
+      throw new Error(`当前打开的是${platform}登录页，请先在"链接测试"里点"打开${platform}登录浏览器"完成一次登录。`);
     }
 
     const normalizedTitle = String((payload && payload.title) || pageTitle || "")
       .replace(/\s*-\s*小红书\s*$/, "")
       .replace(/\s*-\s*抖音\s*$/, "")
       .trim();
+
+    // 封面截图：抓取指标后顺手截作品关键区域，sharp 压成低分辨率 JPEG 落到 uploads/post-covers/
+    // 失败不抛错 —— 没封面也能继续录入
+    let coverImageUrl = "";
+    let coverThumbUrl = "";
+    try {
+      const cover = await capturePostCover(page, platform);
+      if (cover) {
+        coverImageUrl = cover.coverImageUrl;
+        coverThumbUrl = cover.coverThumbUrl;
+      }
+    } catch (coverErr) {
+      // eslint-disable-next-line no-console
+      console.warn(`[metricsFetcher] capturePostCover failed: ${coverErr?.message || coverErr}`);
+    }
 
     return {
       platform,
@@ -599,11 +730,84 @@ async function fetchMetricsFromUrl(url) {
       comments: Number(payload.comments || 0),
       favorites: Number(payload.favorites || 0),
       shares: Number(payload.shares || 0),
+      coverImageUrl,
+      coverThumbUrl,
       metricsUpdatedAt: new Date().toISOString()
     };
   } finally {
     await context.close();
   }
+}
+
+/**
+ * 截取作品页视口作封面，sharp 缩放压成低分辨率 JPEG 落到 uploads/post-covers/。
+ *
+ * 历史策略：先 locator（平台特定选择器）→ video poster → og:image → first img → 视口兜底。
+ *   实测抖音/小红书里 locator 选择器经常命中 32×32 头像、og:image 经常是 52×90 分享卡，
+ *   "first img" 因 lazy load 拿到的是不可见的占位图，5 路并行下经常拿到的是错的。
+ *   视口截图拿的是页面真实首屏，最稳。
+ *
+ * 优化：page.screenshot 用 omitBackground=false + clip 选作品主区（避开顶部导航）。
+ *   整体 1.2s 上限；写入落盘 ~150ms。
+ */
+async function capturePostCover(page, platform) {
+  // 视口截图：clip 区域 (0, header 高度, viewport 宽, 作品主区高度)
+  // 避免取到顶部导航栏 + 评论区。header 高度 ~80px, 主区 980px (1100-120)。
+  try {
+    const buf = await page.screenshot({
+      type: "png",
+      clip: { x: 0, y: 0, width: 1440, height: 1080 },
+    });
+    if (buf && buf.length > 1024) {
+      return await writeCoverJpeg(buf, "viewport");
+    }
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn(`[metricsFetcher] viewport screenshot failed: ${err?.message || err}`);
+  }
+  return null;
+}
+
+/**
+ * 用 Playwright 的 page 上下文 fetch 一张远程图片，拿到原始 Buffer。
+ * 不用 node fetch：能复用登录态 Cookie，命中平台防盗链。
+ */
+async function fetchImageBuffer(url, page) {
+  try {
+    const data = await page.evaluate(async (u) => {
+      const resp = await fetch(u, { credentials: "include" });
+      if (!resp.ok) return null;
+      const blob = await resp.blob();
+      const ab = await blob.arrayBuffer();
+      return { ok: true, bytes: Array.from(new Uint8Array(ab)), type: blob.type };
+    }, url);
+    if (!data?.ok) return null;
+    return Buffer.from(data.bytes);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 把任意来源的 Buffer 用 sharp 缩放为 ≤ COVER_THUMB_MAX_WIDTH 的 JPEG，写到 uploads/post-covers/，
+ * 返回可访问的 URL（前端 ImageUploadField 提交时直接当 coverImageUrl + coverThumbUrl）。
+ */
+async function writeCoverJpeg(inputBuf, source) {
+  if (!inputBuf || !inputBuf.length) return null;
+  const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const filename = `${stamp}.jpg`;
+  const filepath = path.join(COVERS_DIR, filename);
+  await sharp(inputBuf)
+    .rotate() // 处理 EXIF 方向
+    .resize({ width: COVER_THUMB_MAX_WIDTH, withoutEnlargement: true })
+    .jpeg({ quality: COVER_THUMB_QUALITY, mozjpeg: true })
+    .toFile(filepath);
+  const url = `/uploads/post-covers/${filename}`;
+  return {
+    coverImageUrl: url,
+    coverThumbUrl: url,
+    source,
+  };
 }
 
 module.exports = {

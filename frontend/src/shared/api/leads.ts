@@ -229,6 +229,18 @@ export async function updateLeadBoard(id: string, body: Record<string, unknown>)
   });
 }
 
+/**
+ * 销售"已添加联系方式"按钮 → 把 lead.addStatus 切到 added。
+ * 调后端 PATCH /api/leads/:id/status（lead_status_update 内部走 addStatus 分支）。
+ * 改完后该客资从「我的客资」消失，进入「客资跟进」。
+ */
+export async function markLeadContactAdded(id: string) {
+  return apiClient.request(`/leads/${id}/status`, {
+    method: 'PATCH',
+    body: { addStatus: 'added' },
+  });
+}
+
 export async function createCollaborationTask(body: CreateCollaborationTaskBody) {
   const { leadId, ...payload } = body;
   return apiClient.post(`/leads/${leadId}/collaboration`, payload);
@@ -329,9 +341,10 @@ export async function listTodayFollowupsForSales(query: PageQuery = {}): Promise
 
 /**
  * v1.3 / SA-7: 销售"我的成交"列表。
+ * 支持 status 为字符串或数组（后端 status IN 过滤，"我的成交"默认传 ['completed','closed']）。
  */
 export async function listMyDeals(query: {
-  status?: string;
+  status?: string | string[];
   productType?: string;
   startDate?: string;
   endDate?: string;
@@ -343,11 +356,40 @@ export async function listMyDeals(query: {
   const limit = Number(query.pageSize ?? query.limit ?? 20);
   const page = Number(query.page ?? 1);
   const offset = query.offset ?? (page - 1) * limit;
+  // 数组传参：apiClient 内部 URLSearchParams 会展开成 ?status=completed&status=closed
   const payload = await apiClient.get<unknown>('/sales/deals', {
     query: { ...query, limit, offset },
   });
   const paged = normalizePagedResult<Record<string, unknown>>(payload);
   return { ...paged, page, pageSize: limit, items: paged.items };
+}
+
+/**
+ * v1.3 / SA-12: 销售"改派" — 将客资转给另一个销售。
+ * 后端会做权限校验（当前销售本人 / 主管 / admin / owner），
+ * 写入 operation_logs.REASSIGN，并通知新销售。
+ */
+export async function reassignLead(
+  id: string,
+  body: { newAssigneeId: string; reason?: string },
+) {
+  return apiClient.post<{ ok: boolean; lead?: SalesLead }>(`/leads/${id}/reassign`, body);
+}
+
+/**
+ * v1.3 / SA-12: 获取"改派"弹窗可选销售列表（角色 = sales 的活跃用户）。
+ * 简易实现：拉一次 /users 列表并按 role=sales 过滤；后端若无此端点则兜底返回空数组。
+ */
+export async function listReassignCandidates(): Promise<Array<{ id: string; name: string }>> {
+  try {
+    const payload = await apiClient.get<unknown>('/users', { query: { role: 'sales', active: 1, limit: 200 } });
+    const arr = Array.isArray(payload) ? payload : (payload as any)?.items || [];
+    return (arr as Array<Record<string, unknown>>)
+      .map((u) => ({ id: String(u.id || ''), name: String(u.name || u.username || u.id || '') }))
+      .filter((u) => u.id);
+  } catch {
+    return [];
+  }
 }
 
 const EMPTY_SALES_HOME_SUMMARY: SalesHomeSummary = {

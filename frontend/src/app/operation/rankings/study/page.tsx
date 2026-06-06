@@ -26,6 +26,7 @@ import {
   Table,
   Tabs,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
@@ -36,12 +37,26 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { createExport, downloadExportUrl, getExport } from '@/shared/api/exports';
 import { apiClient } from '@/shared/api/apiClient';
 import { getPostDetail, togglePostFavorite } from '@/shared/api/content';
+import { QuickRangePicker, RANGE_PRESETS_FULL } from '@/shared/components/date';
+import type { DateRangeValue } from '@/shared/components/date';
 import type { ContentPost } from '@/shared/types/content';
 
 type StudyPeriod = '7' | '14' | '30';
 type StudyTab = 'posts' | 'accounts' | 'picks';
 /** v1.3 OP-8：学习榜单维度切换 */
 type StudyDimension = 'traffic' | 'leads' | 'composite';
+
+/**
+ * 把 QuickRangePicker 输出的 {start,end} 反推为后端 days 数字字符串。
+ * 后端只支持 7/14/30；其他粒度（3/6/9 天、3/5 周、3/6 月、近 3 年）会被退化解释。
+ */
+function deriveStudyPeriod(range: DateRangeValue): StudyPeriod {
+  if (!range) return '7';
+  const days = Math.max(0, range.end.diff(range.start, 'day'));
+  if (days <= 7) return '7';
+  if (days <= 14) return '14';
+  return '30';
+}
 
 interface LearningPost {
   id: string;
@@ -86,13 +101,6 @@ interface AccountStat {
   topPostLeads?: number;
 }
 
-const PERIOD_OPTIONS = [
-  { label: '近 7 天', value: '7' },
-  { label: '近 14 天', value: '14' },
-  { label: '近 30 天', value: '30' },
-];
-
-/** v1.3 OP-8：维度切换器 */
 const DIMENSION_OPTIONS: Array<{ label: string; value: StudyDimension }> = [
   { label: '流量优先', value: 'traffic' },
   { label: '客资优先', value: 'leads' },
@@ -103,7 +111,7 @@ const TAB_OPTIONS: TabsProps['items'] = [
   { key: 'posts', label: '优秀作品榜', icon: <StarOutlined /> },
   { key: 'accounts', label: '优秀账号榜', icon: <AppstoreOutlined /> },
   /** v1.3 OP-10：主管推荐板块 */
-  { key: 'picks', label: '主管推荐', icon: <StarOutlined /> },
+  { key: 'picks', label: '推荐作品', icon: <StarOutlined /> },
 ];
 
 function numberValue(value: unknown): number {
@@ -161,7 +169,8 @@ function mapLearningPost(raw: Record<string, unknown>): LearningPost {
 
 export default function StudyRankingsPage() {
   const router = useRouter();
-  const [period, setPeriod] = useState<StudyPeriod>('7');
+  const [range, setRange] = useState<DateRangeValue>(null);
+  const period: StudyPeriod = deriveStudyPeriod(range);
   const [dimension, setDimension] = useState<StudyDimension>('composite');
   const [tab, setTab] = useState<StudyTab>('posts');
   const [loading, setLoading] = useState(false);
@@ -308,8 +317,8 @@ export default function StudyRankingsPage() {
     void loadPicks(30);
   }, [loadPicks]);
 
-  function changePeriod(nextPeriod: StudyPeriod) {
-    setPeriod(nextPeriod);
+  function changeRange(next: DateRangeValue) {
+    setRange(next);
   }
 
   function changeDimension(nextDim: StudyDimension) {
@@ -396,6 +405,19 @@ export default function StudyRankingsPage() {
     router.push(`/operation/posts?accountId=${encodeURIComponent(post.accountId)}`);
   }
 
+  /**
+   * 跳转到账号管理页，并只查看该条账号。
+   * accounts 页读 ?id= 后会在客户端把列表只保留这一行，并展示清除按钮。
+   * 接受 AccountStat 或 LearningPost，统一从 accountId 字段读账号 ID。
+   */
+  function viewAccountDetail(record: { accountId?: string }) {
+    if (!record.accountId) {
+      message.warning('该账号缺少 ID');
+      return;
+    }
+    router.push(`/operation/accounts?id=${encodeURIComponent(record.accountId)}`);
+  }
+
   async function viewPostDetail(post: LearningPost) {
     setDetailVisible(true);
     setDetailLoading(true);
@@ -428,17 +450,23 @@ export default function StudyRankingsPage() {
     {
       title: '作品',
       width: 240,
-      render: (_: unknown, record: LearningPost) => (
-        <Space direction="vertical" size={4}>
+      render: (_: unknown, record: LearningPost) => {
+        const truncated = record.title.length > 8 ? `${record.title.slice(0, 8)}…` : record.title;
+        const node = (
           <Typography.Text strong ellipsis style={{ maxWidth: 220 }}>
-            {record.title}
+            {truncated}
           </Typography.Text>
-          <Space wrap>
-            <Tag color={record.platform.includes('抖') ? 'blue' : 'red'}>{record.platform}</Tag>
-            <Tag>{record.postType || '未分类'}</Tag>
+        );
+        return (
+          <Space direction="vertical" size={4}>
+            {record.title.length > 8 ? <Tooltip title={record.title}>{node}</Tooltip> : node}
+            <Space wrap>
+              <Tag color={record.platform.includes('抖') ? 'blue' : 'red'}>{record.platform}</Tag>
+              <Tag>{record.postType || '未分类'}</Tag>
+            </Space>
           </Space>
-        </Space>
-      ),
+        );
+      },
     },
     {
       title: '封面',
@@ -480,7 +508,15 @@ export default function StudyRankingsPage() {
       width: 140,
       render: (_: unknown, record: LearningPost) => (
         <Space direction="vertical" size={0}>
-          <Typography.Text>{record.accountName || '未知账号'}</Typography.Text>
+          <Button
+            type="link"
+            size="small"
+            style={{ padding: 0, height: 'auto' }}
+            disabled={!record.accountId}
+            onClick={() => viewAccountDetail(record)}
+          >
+            {record.accountName || '未知账号'}
+          </Button>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             {record.employeeName || '未知运营'}
           </Typography.Text>
@@ -538,7 +574,7 @@ export default function StudyRankingsPage() {
       dataIndex: 'accountName',
       width: 160,
       render: (name: string, record: AccountStat) => (
-        <Button type="link" size="small" onClick={() => router.push(`/operation/posts?accountId=${encodeURIComponent(record.accountId)}`)}>
+        <Button type="link" size="small" onClick={() => viewAccountDetail(record)}>
           {name}
         </Button>
       ),
@@ -606,18 +642,24 @@ export default function StudyRankingsPage() {
     {
       title: '作品',
       width: 240,
-      render: (_: unknown, record: LearningPost) => (
-        <Space direction="vertical" size={4}>
+      render: (_: unknown, record: LearningPost) => {
+        const truncated = record.title.length > 8 ? `${record.title.slice(0, 8)}…` : record.title;
+        const node = (
           <Typography.Text strong ellipsis style={{ maxWidth: 220 }}>
-            {record.title}
+            {truncated}
           </Typography.Text>
-          <Space wrap>
-            <Tag color="gold">主管推荐</Tag>
-            <Tag color={record.platform.includes('抖') ? 'blue' : 'red'}>{record.platform}</Tag>
-            <Tag>{record.postType || '未分类'}</Tag>
+        );
+        return (
+          <Space direction="vertical" size={4}>
+            {record.title.length > 8 ? <Tooltip title={record.title}>{node}</Tooltip> : node}
+            <Space wrap>
+              <Tag color="gold">主管推荐</Tag>
+              <Tag color={record.platform.includes('抖') ? 'blue' : 'red'}>{record.platform}</Tag>
+              <Tag>{record.postType || '未分类'}</Tag>
+            </Space>
           </Space>
-        </Space>
-      ),
+        );
+      },
     },
     {
       title: '封面',
@@ -659,7 +701,15 @@ export default function StudyRankingsPage() {
       width: 140,
       render: (_: unknown, record: LearningPost) => (
         <Space direction="vertical" size={0}>
-          <Typography.Text>{record.accountName || '未知账号'}</Typography.Text>
+          <Button
+            type="link"
+            size="small"
+            style={{ padding: 0, height: 'auto' }}
+            disabled={!record.accountId}
+            onClick={() => viewAccountDetail(record)}
+          >
+            {record.accountName || '未知账号'}
+          </Button>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             {record.employeeName || '未知运营'}
           </Typography.Text>
@@ -709,10 +759,12 @@ export default function StudyRankingsPage() {
             value={dimension}
             onChange={(val) => changeDimension(val as StudyDimension)}
           />
-          <Segmented
-            options={PERIOD_OPTIONS}
-            value={period}
-            onChange={(val) => changePeriod(val as StudyPeriod)}
+          <QuickRangePicker
+            value={range}
+            onChange={changeRange}
+            variant="select"
+            presets={RANGE_PRESETS_FULL}
+            selectWidth={140}
           />
           <Button icon={<DownloadOutlined />} loading={exporting} onClick={handleExport}>
             导出
